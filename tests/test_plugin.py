@@ -126,6 +126,44 @@ def test_wrap_for_render_tab_indent_survives_word_wrap():
         assert "\t" not in line
 
 
+def test_wrap_for_render_expands_interior_tabs_too():
+    # Regression (round 4 review): only the LEADING tab run was being
+    # expanded; an interior tab (not at line start) survived untouched and
+    # corrupted through real OCR ("name\tage\tcity" -> "name[jage[[city").
+    # render_ocr's own public entrypoint (retype) takes a raw string, not
+    # one stage 1 has already cleaned, so this must be handled here too,
+    # not just relied on upstream. Exact spacing after tab expansion is not
+    # guaranteed (word-wrap re-joins on single spaces), but no raw tab byte
+    # may survive into a wrapped render line under any circumstance.
+    wrapped = render_ocr._wrap_for_render("name\tage\tcity")
+    assert len(wrapped) == 1
+    assert "\t" not in wrapped[0]
+    assert wrapped[0].split() == ["name", "age", "city"]
+
+
+def test_wrap_for_render_hard_splits_unbreakable_long_word():
+    # Regression (round 4 review): a single token with no spaces (a URL,
+    # API key, or hash) longer than MAX_CHARS_PER_LINE used to be emitted
+    # as one oversized render line that ran off the fixed-width canvas,
+    # and OCR read back garbage for the overflow. Every wrapped line must
+    # now fit within max_chars regardless of word length.
+    long_token = "x" * 250
+    wrapped = render_ocr._wrap_for_render(long_token, max_chars=100)
+    assert len(wrapped) > 1
+    for line in wrapped:
+        assert len(line) <= 100
+    assert "".join(wrapped) == long_token
+
+
+def test_wrap_for_render_hard_split_preserves_all_characters():
+    # The split must be lossless: rejoining every wrapped line (indent
+    # already accounted for at len 0 here) must reproduce the original
+    # token exactly, not drop or duplicate characters at the split points.
+    long_token = "abcdefghij" * 30  # 300 chars, no spaces
+    wrapped = render_ocr._wrap_for_render(long_token, max_chars=100)
+    assert "".join(wrapped) == long_token
+
+
 def test_interior_whitespace_still_collapses():
     # Confirms the fix is scoped correctly: leading indent is protected,
     # but stray interior double-spacing (the thing this collapse exists
@@ -354,6 +392,34 @@ def test_hard_cut_page_seam_preserves_word_boundary_not_newline():
             first_line_of_next_page = pages[i + 1][0]
             seam = last_line_of_page + " " + first_line_of_next_page
             assert seam in merged
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION (round 4 review): _postprocess_ocr unconditionally strips
+# trailing blank lines (it has no way to tell OCR noise from a real
+# trailing blank), so text that intentionally ends with a blank line (a
+# markdown paragraph separator, for example) silently lost it on every
+# stage-2 pass, and the suspect gate did not catch it since it only checks
+# non-whitespace content and leading indentation, never trailing blanks.
+# Fixed by having _retype_page restore however many trailing blank lines
+# the wrapped original actually had.
+# ---------------------------------------------------------------------------
+
+def test_trailing_blank_line_survives_retype():
+    text = "Report on status: all systems nominal.\n\n"
+    result = render_ocr.retype(text)
+    assert result.clean_text.endswith("\n\n"), (
+        f"trailing blank line was dropped: {result.clean_text!r}"
+    )
+
+
+def test_multiple_trailing_blank_lines_survive_retype():
+    text = "First paragraph.\n\n\nSecond line of content.\n\n\n"
+    result = render_ocr.retype(text)
+    # wrapping/OCR do not promise exact blank-line counts beyond "at least
+    # the original had some trailing blank content", so assert on presence
+    # of a trailing blank rather than an exact count.
+    assert result.clean_text.endswith("\n\n") or result.clean_text.endswith("\n\n\n")
 
 
 # ---------------------------------------------------------------------------

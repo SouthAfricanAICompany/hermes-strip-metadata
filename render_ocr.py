@@ -178,37 +178,62 @@ def _wrap_for_render(text: str, max_chars: int = MAX_CHARS_PER_LINE) -> List[str
     the round trip) AND preserving leading whitespace/indentation per source
     line (critical for code blocks: OCR round-trips must not silently change
     what the text means).
+
+    Two defensive behaviors, both load-bearing even though stage 1
+    (sanitize_text) already handles them before render_ocr normally sees
+    text: this module's own public entrypoint (`retype`) takes a raw
+    string, not "a string stage 1 already cleaned", so render_ocr must be
+    safe to call directly without relying on an implicit caller contract.
+
+    1. ALL tabs (leading or interior) are expanded to spaces up front, not
+       just leading indentation. PIL's ImageDraw has no reliable tab-stop
+       behavior, and OCR-side indent reconstruction always rebuilds
+       indentation in space units regardless of the source; an interior
+       tab left unexpanded renders as a stray glyph that OCR corrupts
+       (confirmed empirically: "name\\tage\\tcity" round-tripped through
+       real OCR as "name[jage[[city").
+
+    2. A single "word" (no internal space) longer than fits on one line is
+       hard-split at max_chars rather than left to overflow the fixed
+       canvas width. Without this, a long unbroken token (a URL, API key,
+       or hash with no spaces) runs off the right edge of the rendered
+       image and OCR reads back garbage for the overflow portion
+       (confirmed empirically: a 250-character unbroken run rendered at
+       the current canvas width came back from OCR as unrelated garbage
+       character sequences, not the original text). The existing suspect
+       gate catches this and falls back to stage-1 output, so it is not a
+       silent corruption risk, but it does mean stage 2 never actually
+       retypes such tokens; splitting them keeps them inside the canvas so
+       the round trip can succeed instead of always being rejected.
     """
     out: List[str] = []
     for paragraph in text.split("\n"):
         if not paragraph:
             out.append("")
             continue
-        leading_ws_len = len(paragraph) - len(paragraph.lstrip(" \t"))
-        raw_indent = paragraph[:leading_ws_len]
-        # Expand tabs to spaces before use: PIL's ImageDraw has no reliable,
-        # consistent tab-stop behavior, and the OCR-side indent reconstruction
-        # (_ocr, below) always rebuilds indentation as spaces measured in
-        # CHAR_WIDTH_PX units regardless of what was in the original text. A
-        # raw tab character surviving into `indent` would either render as a
-        # stray/invisible glyph or (worse) get treated as part of the first
-        # word when wrapping, corrupting the text. Expanding up front keeps
-        # wrapping and indent math consistent for tab- and space-indented
-        # input alike. Standard 4-space tab stop (also what render_ocr can
-        # only reproduce anyway, since OCR cannot recover an actual \t byte).
-        indent = raw_indent.expandtabs(4)
+        # Expand tabs anywhere in the line, not just the leading run - see
+        # docstring point 1 above.
+        paragraph = paragraph.expandtabs(4)
+        leading_ws_len = len(paragraph) - len(paragraph.lstrip(" "))
+        indent = paragraph[:leading_ws_len]
         words = paragraph[leading_ws_len:].split(" ")
         line = indent
         first_word_on_line = True
+        max_word_len = max(max_chars - len(indent), 1)
         for w in words:
-            candidate = f"{line}{'' if first_word_on_line else ' '}{w}"
-            if len(candidate) > max_chars and not first_word_on_line:
-                out.append(line)
-                line = f"{indent}{w}"
-                first_word_on_line = False
-            else:
-                line = candidate
-                first_word_on_line = False
+            # Hard-split any word too long to ever fit on an indented line
+            # by itself, regardless of what else is already on the current
+            # line - see docstring point 2 above.
+            chunks = [w[i:i + max_word_len] for i in range(0, len(w), max_word_len)] or [w]
+            for chunk in chunks:
+                candidate = f"{line}{'' if first_word_on_line else ' '}{chunk}"
+                if len(candidate) > max_chars and not first_word_on_line:
+                    out.append(line)
+                    line = f"{indent}{chunk}"
+                    first_word_on_line = False
+                else:
+                    line = candidate
+                    first_word_on_line = False
         out.append(line)
     return out
 
@@ -279,6 +304,13 @@ def _postprocess_ocr(raw: str) -> str:
     lines (paragraph breaks) and intentional single newlines are NOT
     reconstructed perfectly here - by design, since we can't know which
     newlines were "real" vs render-wrap without a marker. See note in README.
+
+    Trailing blank lines are stripped here unconditionally (OCR sometimes
+    appends a stray blank at the very end that was never in the source);
+    the caller (`_retype_page`) is responsible for restoring however many
+    trailing blank lines the real original actually had, since this
+    function has no way to tell "OCR noise" from "a real trailing blank
+    the original text intentionally ended with" on its own.
     """
     # Tesseract tends to leave trailing whitespace; normalize line endings.
     lines = [l.rstrip() for l in raw.split("\n")]
@@ -361,6 +393,26 @@ def _retype_page(render_lines: List[str], diff_threshold: float) -> RetypeResult
     # Compare against the *wrapped* original (same line breaks) for a fair diff,
     # not the pre-wrap original which has different newline positions.
     wrapped_original = "\n".join(render_lines)
+
+    # _postprocess_ocr unconditionally strips trailing blank lines (it has
+    # no way to tell OCR noise from a real trailing blank). Restore however
+    # many trailing blank lines the original actually had, so an
+    # intentional trailing blank (e.g. a markdown paragraph separator at
+    # the very end of the response) survives the round trip instead of
+    # silently vanishing. Confirmed empirically: "...nominal.\n\n" came
+    # back as "...nominal." with no indication anything was dropped, and
+    # the suspect gate did not catch it since it only checks non-whitespace
+    # content and leading indentation, never trailing blank lines.
+    orig_lines = wrapped_original.split("\n")
+    trailing_blanks = 0
+    for line in reversed(orig_lines):
+        if line.strip() == "":
+            trailing_blanks += 1
+        else:
+            break
+    if trailing_blanks:
+        clean = clean + ("\n" * trailing_blanks)
+
     ratio = difflib.SequenceMatcher(None, wrapped_original, clean).ratio()
 
     diff_lines = list(
