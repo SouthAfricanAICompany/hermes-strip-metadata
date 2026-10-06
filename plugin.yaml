@@ -14,4 +14,4 @@ python_dependencies:
   - fonttools
 author: "SAAIC (South African AI Company), https://saaic.co.za"
 license: MIT
-homepage: "https://github.com/saaic/hermes-strip-metadata"
+homepage: "https://github.com/SouthAfricanAICompany/hermes-strip-metadata"
