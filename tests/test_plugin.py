@@ -93,6 +93,93 @@ def test_strips_orphaned_opener_from_unterminated_quote_attribute():
     assert "bold" in result
 
 
+def test_does_not_strip_single_letter_tag_name_used_as_variable_in_comparison():
+    # Regression (round 7 review): the HTML tag whitelist includes
+    # single-letter tag names (a, b, i, s, q, u, p). A bare "anything
+    # that isn't < or >" attribute blob let a short variable name right
+    # after "<" match the whitelist as if it were a real tag, silently
+    # deleting plain comparison text. Confirmed empirically: this exact
+    # input used to come back as "results show xb, so x<a<b is false
+    # when b<a" - the whole "<a and y>" clause vanished.
+    text = "results show x<a and y>b, so x<a<b is false when b<a"
+    assert plugin.sanitize_text(text) == text
+
+
+def test_does_not_strip_single_letter_tag_name_in_code_comparison():
+    # Same bug (round 7 review), confirmed with real code rather than
+    # prose: used to come back as "if xli: print('ok')" (working code
+    # destroyed) because "li" is also a whitelisted tag name.
+    text = "if x<li and y>li: print('ok')"
+    assert plugin.sanitize_text(text) == text
+
+
+def test_still_strips_real_tag_with_equals_attribute_despite_bare_word_guard():
+    # The round-7 "no '=' means it's probably not markup" guard must not
+    # regress genuine tags that DO have real name=value attributes.
+    text = 'a <a href="https://x.com">link</a> b'
+    assert plugin.sanitize_text(text) == "a link b"
+
+
+def test_orphan_tag_opener_pass_also_respects_no_equals_guard():
+    # The round-6 orphan-opener cleanup pass runs as a second pass after
+    # the main pattern and did not share the round-7 "=" guard, so it
+    # independently re-deleted the same "<a" token the main pattern had
+    # just correctly left alone. Confirmed empirically: after the main
+    # pattern fix, this input still came back with "<a" stripped by the
+    # orphan pass alone.
+    text = "results show x<a and y>b, so x<a<b is false when b<a"
+    assert plugin.sanitize_text(text) == text
+
+
+def test_orphan_tag_opener_pass_does_not_strip_tagname_inside_backtick_code_span():
+    # Regression (round 7 review): the orphan-opener pass used to delete
+    # a literal "<tagname" token even when it's the deliberate subject of
+    # a sentence (e.g. documentation explaining the token itself) inside
+    # a markdown code span. Confirmed empirically: this exact input used
+    # to come back with both "<script" occurrences deleted.
+    text = (
+        "explain what `<script` means, example: "
+        '`<script src="x` in a tutorial.'
+    )
+    assert plugin.sanitize_text(text) == text
+
+
+def test_orphan_tag_opener_pass_still_strips_unterminated_quote_outside_code_span():
+    # The round-7 backtick guard must not swallow the original round-6
+    # fix: an orphaned opener NOT inside backticks still gets stripped.
+    text = '<a href="unterminated clicked</a> more text <b>bold</b>'
+    result = plugin.sanitize_text(text)
+    assert "<" not in result
+    assert ">" not in result
+
+
+def test_zwj_preserved_between_emoji_in_compound_sequence():
+    # Regression (round 7 review): ZWJ (U+200D) was blanket-stripped as
+    # an "invisible" character, but it's the real required glue in
+    # standard compound emoji sequences. Confirmed empirically: the
+    # 4-person family emoji used to lose all 3 ZWJ characters, turning
+    # one compound glyph into 4 unrelated emoji.
+    family = "\U0001F468\u200D\U0001F469\u200D\U0001F467\u200D\U0001F466"
+    assert plugin.sanitize_text(family) == family
+
+
+def test_zwj_preserved_in_woman_health_worker_sequence():
+    # Same bug, a second real-world ZWJ emoji sequence (woman + ZWJ +
+    # medical symbol + variation selector).
+    seq = "\U0001F469\u200D\u2695\uFE0F"
+    result = plugin.sanitize_text(seq)
+    assert "\u200d" in result
+
+
+def test_zwj_still_stripped_between_plain_text_characters():
+    # ZWJ sitting between two ordinary (non-emoji) characters is still a
+    # real steganographic vector (e.g. inserted mid-word to hide a
+    # payload) and must still be removed - the round-7 fix is contextual,
+    # not a blanket "never strip ZWJ" rollback.
+    text = "hel\u200dlo"
+    assert plugin.sanitize_text(text) == "hello"
+
+
 def test_does_not_strip_cpp_generic_syntax():
     # Regression (round 3 review): a bare "anything in angle brackets" regex
     # deleted C++/Java generic type arguments. vector<int> is not HTML.

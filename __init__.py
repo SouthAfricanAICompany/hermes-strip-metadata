@@ -12,13 +12,27 @@ import re
 import unicodedata
 
 # Zero-width / invisible characters used for text watermarking or tracking.
-# U+200B ZERO WIDTH SPACE, U+200C/D ZWNJ/ZWJ, U+2060 WORD JOINER,
+# U+200B ZERO WIDTH SPACE, U+200C ZWNJ, U+2060 WORD JOINER,
 # U+FEFF BOM/ZERO WIDTH NO-BREAK SPACE, U+00AD SOFT HYPHEN,
 # Unicode "variation selectors" (U+FE00-FE0F) sometimes abused for payload hiding,
 # and the tag-block range (U+E0000-E007F) used by some watermarking schemes.
+#
+# U+200D ZWJ (ZERO WIDTH JOINER) is handled separately by
+# `_strip_watermark_zwj` below, NOT blanket-stripped here. Round 7 review:
+# ZWJ is the real, required glue character in standard compound emoji
+# (family emoji, "woman health worker", etc. - any ZWJ emoji sequence).
+# Confirmed empirically: sanitize_text() on the 4-person family emoji
+# (U+1F468 ZWJ U+1F469 ZWJ U+1F467 ZWJ U+1F466) used to strip all 3 ZWJ
+# characters, turning one compound glyph into 4 unrelated emoji - visible
+# content corruption of completely ordinary text, not a watermark hit.
+# ZWJ is still a real steganographic vector when it sits between ordinary
+# (non-emoji) characters, e.g. inserted mid-word to hide a payload - that
+# case is still stripped, just contextually, by `_strip_watermark_zwj`.
 _INVISIBLE_PATTERN = re.compile(
     "["
-    "\u200b-\u200f"   # zero-width space/joiners, LRM/RLM
+    "\u200b"          # zero-width space
+    "\u200c"          # ZWNJ (word-ligature control, not emoji-joining)
+    "\u200e\u200f"    # LRM/RLM
     "\u202a-\u202e"   # bidi embedding/override controls
     "\u2060-\u2064"   # word joiner, invisible operators
     "\ufeff"          # BOM
@@ -27,6 +41,33 @@ _INVISIBLE_PATTERN = re.compile(
     "\U000e0000-\U000e007f"  # tag block
     "]"
 )
+
+# Emoji-ish codepoint ranges: Misc Symbols/Dingbats (U+2600-27BF) plus the
+# whole supplementary emoji/pictograph/symbol plane (U+1F000-1FFFF, covers
+# emoticons, transport, symbols & pictographs, skin-tone modifiers, etc.).
+# Used only to decide whether a ZWJ sits between two real emoji (keep it,
+# it's load-bearing) vs. between ordinary text (strip it, likely stego).
+_EMOJI_ISH = re.compile(r"[\u2600-\u27bf\U0001f000-\U0001ffff]")
+
+
+def _strip_watermark_zwj(text: str) -> str:
+    """Remove ZWJ (U+200D) everywhere EXCEPT where it joins two emoji-ish
+    characters, where it is the real glue holding a compound emoji
+    together and removing it corrupts visible content rather than
+    defeating any watermark (see _INVISIBLE_PATTERN's docstring above for
+    the empirical repro)."""
+    if "\u200d" not in text:
+        return text
+
+    def _keep_or_strip(m: "re.Match") -> str:
+        idx = m.start()
+        before = text[idx - 1] if idx > 0 else ""
+        after = text[idx + 1] if idx + 1 < len(text) else ""
+        if _EMOJI_ISH.match(before) and _EMOJI_ISH.match(after):
+            return m.group(0)
+        return ""
+
+    return re.sub("\u200d", _keep_or_strip, text)
 
 # Common AI-platform watermark character sometimes injected between words.
 _SUSPICIOUS_LOOKALIKES = {
@@ -66,9 +107,46 @@ _HTML_TAG_NAMES = (
 # so the whole real tag - attributes included - is stripped as one unit.
 _ATTR_CONTENT = r'(?:"[^"]*"|\'[^\']*\'|[^<>\n])'
 _HTML_TAG_PATTERN = re.compile(
-    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?:\s" + _ATTR_CONTENT + r"{0,200})?\s*/?>",
+    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")\b(?P<attrs>(?:\s" + _ATTR_CONTENT + r"{0,200})?)\s*/?>",
     re.IGNORECASE,
 )
+
+
+def _strip_html_tags(text: str) -> str:
+    """Strip real HTML tags, but reject a candidate match whose "attributes"
+    are non-empty plain words containing no "=" anywhere.
+
+    Round 7 review found that a bare tag-name whitelist plus a lenient
+    "anything that isn't < or >" attribute blob matches ordinary prose and
+    code as if it were markup, whenever a short tag name (a, b, i, s, q, u,
+    p, li, dd, ...) happens to collide with a variable name or word used
+    right after a "<". Confirmed empirically:
+      "results show x<a and y>b, so x<a<b is false when b<a"
+      -> used to come back as "results show xb, so x<a<b is false when b<a"
+         (the whole "<a and y>" comparison clause silently deleted)
+      "if x<li and y>li: print('ok')"
+      -> used to come back as "if xli: print('ok')" (working code destroyed)
+
+    Real HTML attributes are almost always name=value pairs (href=, src=,
+    class=, id=...). A run of bare words with no "=" anywhere in the
+    attribute span is far more consistent with a comparison/code false
+    positive than genuine markup, so such a match is left untouched rather
+    than stripped. Known, accepted trade-off: a stray leaked HTML tag using
+    only bare boolean attributes (e.g. "<input disabled>") will no longer
+    be stripped either - rare in practice, and this is a defensive layer
+    for accidental tag leakage, not a guarantee against deliberately
+    crafted markup.
+    """
+
+    def _repl(m: "re.Match") -> str:
+        attrs = m.group("attrs")
+        if attrs and attrs.strip() and "=" not in attrs:
+            return m.group(0)
+        return ""
+
+    return _HTML_TAG_PATTERN.sub(_repl, text)
+
+
 # Cleanup pass for a tag the pattern above cannot fully match: an attribute
 # value with an unterminated quote (no matching closing quote anywhere in
 # the text) has no legal way to reach the required trailing ">" within the
@@ -93,10 +171,62 @@ _HTML_TAG_PATTERN = re.compile(
 # leaving whatever attribute-like text followed it intact as harmless
 # plain text, same as any other malformed snippet sanitize_text doesn't
 # try to fully parse.
+#
+# Round 7 review found this pass is itself too eager when the "<tagname"
+# token is the deliberate subject of discussion rather than a failed
+# markup attempt, e.g. documentation or a chat message literally
+# explaining what "<script" means, especially inside a markdown code
+# span (backticks). Confirmed empirically:
+#   'explain what `<script` means ... like this unterminated example:
+#    `<script src="x` in a tutorial.'
+#   -> both literal "<script" occurrences, each inside its own pair of
+#      backticks, were deleted even though neither one is a broken
+#      markup attempt - they're text about the token itself.
+# Fixed by skipping any orphan-opener candidate that sits inside a
+# backtick-delimited code span: if an odd number of backticks appear
+# before the match on the same line, the match is inside an open code
+# span and is left untouched (the whole point of a code span is "render
+# this literally, don't interpret it as markup").
+# Round 7 also found this pass doesn't share _strip_html_tags's "bare-word
+# attributes with no '=' are probably code/comparison text, not markup"
+# rejection - so a short tag name rejected by the main pattern for that
+# reason (e.g. the "<a" in "x<a and y>b") still got eaten here as an
+# "orphan opener", even though it was never a broken tag to begin with.
+# Confirmed empirically: "results show x<a and y>b, so x<a<b is false
+# when b<a" - after _strip_html_tags correctly left it alone, this pass
+# still deleted the lone "<a" token. Fixed by requiring an "=" to appear
+# somewhere between the match and either the next "<"/end-of-line,
+# matching the same intuition: a genuine broken-tag opener is followed
+# by attribute-like text (href="..., src=...), while a comparison/code
+# false positive is followed by plain words and no "=" at all.
 _ORPHAN_TAG_PATTERN = re.compile(
     r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")\b",
     re.IGNORECASE,
 )
+
+
+def _strip_orphan_tag_openers(text: str) -> str:
+    lines = text.split("\n")
+    out_lines = []
+    for line in lines:
+        def _repl(m: "re.Match") -> str:
+            # Odd number of backticks before the match = inside an open
+            # code span on this line = leave it alone, it's literal text.
+            if line[: m.start()].count("`") % 2 == 1:
+                return m.group(0)
+            # No real attribute-style "=" between here and the next "<"
+            # or end of line = this reads as plain prose/code that merely
+            # starts with a tag-name-shaped word, not a broken tag.
+            tail = line[m.end():]
+            next_lt = tail.find("<")
+            scope = tail[:next_lt] if next_lt != -1 else tail
+            if "=" not in scope:
+                return m.group(0)
+            return ""
+
+        out_lines.append(_ORPHAN_TAG_PATTERN.sub(_repl, line))
+    return "\n".join(out_lines)
+
 
 
 def sanitize_text(text: str) -> str:
@@ -112,21 +242,30 @@ def sanitize_text(text: str) -> str:
     # 1. Drop invisible/watermarking code points outright.
     cleaned = _INVISIBLE_PATTERN.sub("", text)
 
+    # 1b. ZWJ (U+200D) needs context: strip it everywhere except where it
+    #     joins two emoji into one real compound glyph (see
+    #     _strip_watermark_zwj's docstring - round 7 fix).
+    cleaned = _strip_watermark_zwj(cleaned)
+
     # 2. Unicode-normalize to NFC so combining-character tricks collapse to
     #    their canonical form (defeats some steganographic combining-mark use).
     cleaned = unicodedata.normalize("NFC", cleaned)
 
     # 3. Strip any stray HTML tags that sometimes leak through clipboard/RTF
     #    paste paths (defensive; the model's plain-text output shouldn't have
-    #    these, but a tool-result echo sometimes does).
-    cleaned = _HTML_TAG_PATTERN.sub("", cleaned)
+    #    these, but a tool-result echo sometimes does). Rejects bare-word
+    #    "attributes" with no "=" at all - see _strip_html_tags's docstring
+    #    (round 7 fix for the <a>/<b>/<li>-as-variable-name false positive).
+    cleaned = _strip_html_tags(cleaned)
 
     # 3b. Second pass: remove any orphaned tag-opener fragment left behind
     #     by an unterminated-quote attribute that couldn't match the
     #     quote-balanced pattern above (see _ORPHAN_TAG_PATTERN docstring).
     #     Runs after 3 so it only ever sees openers that genuinely failed
     #     to close, never a well-formed tag (those are already gone).
-    cleaned = _ORPHAN_TAG_PATTERN.sub("", cleaned)
+    #     Skips matches inside an open backtick code span - see
+    #     _strip_orphan_tag_openers's docstring (round 7 fix).
+    cleaned = _strip_orphan_tag_openers(cleaned)
 
     # 4. Collapse runs of whitespace introduced by the removals above, but
     #    preserve intentional single newlines/paragraph breaks AND leading
