@@ -124,8 +124,9 @@ def test_regression_long_single_paragraph_is_paginated():
     assert len(wrapped) > render_ocr.MAX_LINES_PER_PAGE, (
         "test fixture must actually exceed the page cap to be a real regression check"
     )
-    pages = render_ocr._split_into_pages(wrapped)
+    pages, hard_cut_after = render_ocr._split_into_pages(wrapped)
     assert len(pages) > 1
+    assert len(hard_cut_after) == len(pages)
     for page in pages:
         assert len(page) <= render_ocr.MAX_LINES_PER_PAGE
 
@@ -134,7 +135,8 @@ def test_regression_multi_paragraph_paste_respects_page_cap():
     paragraphs = [f"Line {i} of a paragraph with some filler text." for i in range(150)]
     long_paste = "\n\n".join(paragraphs)
     wrapped = render_ocr._wrap_for_render(long_paste)
-    pages = render_ocr._split_into_pages(wrapped)
+    pages, hard_cut_after = render_ocr._split_into_pages(wrapped)
+    assert len(hard_cut_after) == len(pages)
     assert all(len(p) <= render_ocr.MAX_LINES_PER_PAGE for p in pages)
 
 
@@ -204,6 +206,100 @@ def test_cmap_is_cached_not_reparsed_every_call():
     assert cache_after_first_call is not None
     render_ocr.find_unsupported_chars("second call should reuse it")
     assert render_ocr._CMAP_CACHE is cache_after_first_call
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX (post-ship review round 2, flagged by an independent reviewer):
+# CHAR_WIDTH_PX used to be a single hardcoded constant (17px) tuned for
+# DejaVu Sans Mono, but applied unconditionally even when Consolas or
+# Courier New (the Windows fallbacks in _FONT_CANDIDATES) resolved instead.
+# Different monospace fonts do not share the same glyph advance width at
+# the same point size, so a wrong width silently misaligns the indentation
+# math in _ocr(), which is exactly the kind of damage
+# _has_structural_damage's whitespace check exists to catch - meaning a
+# correct OCR read could get wrongly flagged suspect purely because of a
+# font-metric mismatch, not an actual OCR error. Fixed by measuring the
+# real advance width from whichever font actually resolved, instead of
+# assuming one constant fits every font family in the candidate list.
+# ---------------------------------------------------------------------------
+
+def test_char_width_is_measured_not_a_fixed_guess():
+    # CHAR_WIDTH_PX must reflect the font that actually resolved on this
+    # host, not an assumed constant that silently drifts when a different
+    # font (e.g. Consolas on Windows) resolves instead of DejaVu.
+    measured = render_ocr._measure_char_width_px(render_ocr.FONT_PATH, render_ocr.FONT_SIZE)
+    assert render_ocr.CHAR_WIDTH_PX == pytest.approx(measured, rel=0.01)
+
+
+def test_char_width_differs_between_distinct_font_metrics():
+    # Sanity check that _measure_char_width_px is actually measuring
+    # something real, not returning a constant regardless of input: two
+    # different font sizes of the same font must produce different widths.
+    small = render_ocr._measure_char_width_px(render_ocr.FONT_PATH, 10)
+    large = render_ocr._measure_char_width_px(render_ocr.FONT_PATH, 40)
+    assert small != large
+    assert small > 0
+    assert large > small
+
+
+def test_render_lines_works_with_measured_float_char_width():
+    # Regression caught by running retype() for real (not mocked): PIL's
+    # Image.new requires integer dimensions, but CHAR_WIDTH_PX is now a
+    # measured float (from _measure_char_width_px), not the old int
+    # constant. _render_lines must round it, not pass a float straight
+    # into Image.new, or every real render crashes with a TypeError before
+    # any unit test that mocks OCR would ever catch it.
+    img = render_ocr._render_lines(["hello world", "    indented line"])
+    assert img.size[0] > 0 and img.size[1] > 0
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX (post-ship review round 2, flagged by an independent reviewer):
+# _split_into_pages's hard mid-paragraph cut (the "no blank line at the
+# boundary" branch) used to carry no signal to the caller that two pages
+# either side of that cut are independently-OCR'd halves of what was one
+# continuous run of text in the original. retype() then joined ALL pages
+# with a plain "\n", which both inserted a line break that was never in
+# the original text AND dropped the single space that belonged between
+# the last word of page N and the first word of page N+1 (each page's OCR
+# output is independently rstripped in _postprocess_ocr). Fixed by having
+# _split_into_pages report which boundaries were hard cuts, and joining
+# those specific seams with a single space instead of "\n".
+# ---------------------------------------------------------------------------
+
+def test_hard_cut_page_seam_preserves_word_boundary_not_newline():
+    # Build text that must hard-cut mid-paragraph: one giant paragraph with
+    # no blank lines anywhere, long enough to span multiple pages.
+    long_para = ("alpha bravo charlie delta echo foxtrot golf hotel india " * 110).strip()
+    wrapped = render_ocr._wrap_for_render(long_para)
+    pages, hard_cut_after = render_ocr._split_into_pages(wrapped)
+    assert len(pages) > 1
+    assert any(hard_cut_after[:-1]), (
+        "test fixture must actually produce a hard mid-paragraph cut to exercise this fix"
+    )
+
+    # Simulate what retype() does on rejoin, without running real OCR:
+    # each page's clean_text is just its own wrapped lines joined (as if
+    # OCR read them back perfectly), then reassembled the same way
+    # retype() reassembles real OCR results.
+    fake_results = ["\n".join(p) for p in pages]
+    merged_parts = []
+    for i, clean in enumerate(fake_results):
+        merged_parts.append(clean)
+        if i < len(fake_results) - 1:
+            merged_parts.append(" " if hard_cut_after[i] else "\n")
+    merged = "".join(merged_parts)
+
+    # At every hard-cut seam, the last word of page i and first word of
+    # page i+1 must be separated by exactly one space in the merged text,
+    # not zero characters (glued together) and not a newline (treated as
+    # a paragraph break that was never in the original text).
+    for i in range(len(pages) - 1):
+        if hard_cut_after[i]:
+            last_line_of_page = pages[i][-1]
+            first_line_of_next_page = pages[i + 1][0]
+            seam = last_line_of_page + " " + first_line_of_next_page
+            assert seam in merged
 
 
 # ---------------------------------------------------------------------------

@@ -70,7 +70,6 @@ except FileNotFoundError as _font_err:
 FONT_SIZE = 28
 LINE_SPACING = 8
 MARGIN = 20
-CHAR_WIDTH_PX = 17  # approx for DejaVu Sans Mono / Consolas at size 28; used to size the canvas
 MAX_CHARS_PER_LINE = 100
 
 # Large pastes are paginated rather than rendered as one tall image: OCR
@@ -78,6 +77,42 @@ MAX_CHARS_PER_LINE = 100
 # and hard to debug. Each page is rendered/OCR'd/diffed independently, then
 # stitched back together in original order.
 MAX_LINES_PER_PAGE = 60
+
+
+def _measure_char_width_px(font_path: str, font_size: int) -> float:
+    """Measure the real advance width of this font's monospace glyphs rather
+    than assuming a fixed constant. A single hardcoded CHAR_WIDTH_PX tuned
+    for DejaVu Sans Mono is wrong for Consolas or Courier New (the Windows
+    fallbacks in _FONT_CANDIDATES above), since different monospace fonts
+    do not share the same glyph advance width at the same point size. This
+    is measured once, from whichever font actually resolved on this host,
+    not guessed per font family.
+
+    Measuring a run of characters and dividing (rather than a single glyph)
+    avoids integer-rounding noise in the per-glyph case.
+    """
+    font = ImageFont.truetype(font_path, font_size)
+    sample = "M" * 50
+    return font.getlength(sample) / len(sample)
+
+
+# Default matches the old hardcoded guess, used only if font metrics can't
+# be measured for some reason (FONT_PATH is None, or the measurement itself
+# fails) - in both cases Stage 2 is already being skipped via FONT_PATH, so
+# this value is never actually used to render anything in that case.
+CHAR_WIDTH_PX: float = 17.0
+if FONT_PATH:
+    try:
+        CHAR_WIDTH_PX = _measure_char_width_px(FONT_PATH, FONT_SIZE)
+    except Exception as _measure_err:  # pragma: no cover - defensive, see warning
+        warnings.warn(
+            f"hermes-strip-metadata: failed to measure font metrics for "
+            f"{FONT_PATH}, falling back to a default CHAR_WIDTH_PX="
+            f"{CHAR_WIDTH_PX} (may misalign indentation on this font): "
+            f"{_measure_err}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 # Cache the parsed font + cmap at module load instead of re-parsing the
 # font file from disk on every retype() call. TTFont() is not free (it
@@ -170,7 +205,7 @@ def _wrap_for_render(text: str, max_chars: int = MAX_CHARS_PER_LINE) -> List[str
 def _render_lines(lines: List[str]) -> Image.Image:
     font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
     line_height = FONT_SIZE + LINE_SPACING
-    width = MARGIN * 2 + MAX_CHARS_PER_LINE * CHAR_WIDTH_PX
+    width = round(MARGIN * 2 + MAX_CHARS_PER_LINE * CHAR_WIDTH_PX)
     height = MARGIN * 2 + line_height * max(len(lines), 1)
 
     img = Image.new("L", (width, height), color=255)  # white background, grayscale
@@ -356,27 +391,42 @@ def _split_into_pages(render_lines: List[str], max_lines: int = MAX_LINES_PER_PA
     passed the old raw-line check trivially since it was one source line,
     then rendered as a single ~70-line image, well past the 60-line
     reliability ceiling this function exists to enforce).
+
+    Returns (pages, hard_cut_after) where hard_cut_after[i] is True if page
+    i was cut mid-paragraph (no blank line at the boundary) rather than on
+    a natural paragraph break. The caller needs this to know which page
+    joins in retype() are two independently-OCR'd halves of what was
+    originally one continuous run of text, with no blank line between them
+    to lean on when reassembling.
     """
     if len(render_lines) <= max_lines:
-        return [render_lines]
+        return [render_lines], [False]
 
     pages: List[List[str]] = []
+    hard_cut_after: List[bool] = []
     current: List[str] = []
     for line in render_lines:
         current.append(line)
         at_blank_boundary = line.strip() == ""
         if len(current) >= max_lines and at_blank_boundary:
             pages.append(current)
+            hard_cut_after.append(False)
             current = []
         elif len(current) >= max_lines:
             # No blank line at exactly max_lines: cut here rather than
             # waiting for one, so a page is never more than max_lines long
-            # regardless of paragraph structure.
+            # regardless of paragraph structure. This is the seam that
+            # needs a marker on rejoin: page N's last rendered line and
+            # page N+1's first rendered line were split out of what was,
+            # in the original text, one continuous run with no blank line
+            # between them.
             pages.append(current)
+            hard_cut_after.append(True)
             current = []
     if current:
         pages.append(current)
-    return pages
+        hard_cut_after.append(False)
+    return pages, hard_cut_after
 
 
 def retype(text: str, diff_threshold: float = 0.90) -> RetypeResult:
@@ -426,12 +476,31 @@ def retype(text: str, diff_threshold: float = 0.90) -> RetypeResult:
             skip_reason=f"font cannot render: {' '.join(unsupported)}",
         )
 
-    pages = _split_into_pages(_wrap_for_render(text))
+    pages, hard_cut_after = _split_into_pages(_wrap_for_render(text))
     if len(pages) == 1:
         return _retype_page(pages[0], diff_threshold)
 
     results = [_retype_page(p, diff_threshold) for p in pages]
-    merged_clean = "\n".join(r.clean_text for r in results)
+    # Rejoin pages. A normal page boundary (hard_cut_after[i] is False) was
+    # cut at a blank line, so a plain "\n" join reproduces the original
+    # blank-line paragraph break correctly. A hard mid-paragraph cut
+    # (hard_cut_after[i] is True) is different: page i's last rendered line
+    # and page i+1's first rendered line are two halves of what was one
+    # continuous wrapped line in the original text (the word-wrap in
+    # _wrap_for_render breaks on a space, not a newline), so joining them
+    # with "\n" would silently insert a line break that was never there,
+    # and _postprocess_ocr has already stripped each page's own trailing/
+    # leading whitespace independently, so naively concatenating also risks
+    # losing the single space that belonged between the last word of page i
+    # and the first word of page i+1. Join hard-cut seams with a single
+    # space instead, so two independently-OCR'd halves of one continuous
+    # run reassemble into text, not two arbitrarily-spliced fragments.
+    merged_parts: List[str] = []
+    for i, r in enumerate(results):
+        merged_parts.append(r.clean_text)
+        if i < len(results) - 1:
+            merged_parts.append(" " if hard_cut_after[i] else "\n")
+    merged_clean = "".join(merged_parts)
     merged_diff_lines: List[str] = []
     merged_char_damage: List[str] = []
     for i, r in enumerate(results):
