@@ -50,8 +50,23 @@ _HTML_TAG_NAMES = (
     "section select slot small source span strong style sub summary sup table tbody td "
     "template textarea tfoot th thead time title tr track u ul var video wbr"
 ).split()
+# Attribute content: anything except a bare "<"/">", OR a fully quoted string
+# that may itself contain "<"/">" characters. Without the quoted-string
+# alternative, a crafted attribute value embedding literal tag-like text
+# (e.g. onclick="...'<script>x</script>'...") stops the outer tag's match
+# at the first "<" INSIDE the quotes, so the outer tag (<a ...>) never
+# matches at all, while the inner "<script>"/"</script>" substrings -
+# which are not real markup, just characters inside a quoted attribute
+# value - DO match the whitelist on their own and get stripped, leaving a
+# mangled, half-stripped fragment behind. Confirmed empirically (round 5
+# review): `<a href="..." onclick="...'<script>x</script>'...">click</a>`
+# came back with the inner fake tags removed but the outer `<a ...>` and
+# its unmatched `</a>` still present verbatim. Treating quoted strings as
+# opaque lets the outer tag match across its full span (quotes and all),
+# so the whole real tag - attributes included - is stripped as one unit.
+_ATTR_CONTENT = r'(?:"[^"]*"|\'[^\']*\'|[^<>\n])'
 _HTML_TAG_PATTERN = re.compile(
-    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?:\s[^<>\n]{0,200})?\s*/?>",
+    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?:\s" + _ATTR_CONTENT + r"{0,200})?\s*/?>",
     re.IGNORECASE,
 )
 

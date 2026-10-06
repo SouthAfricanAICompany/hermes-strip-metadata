@@ -72,7 +72,7 @@ Run the automated regression suite (covers every bug found across the review pro
 ```bash
 pip install pytest
 python3 -m pytest tests/test_plugin.py -v
-# should show: 45 passed
+# should show: 49 passed
 ```
 
 Ask Hermes to output something, then check the actual bytes of what you received (e.g. paste into a hex viewer or run `python3 -c "print([hex(ord(c)) for c in open('out.txt').read()])"`), there should be no characters in the `200b-200f`, `2060-2064`, `feff`, `fe00-fe0f` ranges.

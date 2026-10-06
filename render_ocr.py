@@ -18,6 +18,7 @@ import io
 import os
 import platform
 import re
+import unicodedata
 import warnings
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -172,6 +173,38 @@ class RetypeResult:
     char_damage: List[str] = field(default_factory=list)
 
 
+def _grapheme_clusters(word: str) -> List[str]:
+    """Split `word` into user-perceived characters (base character plus any
+    trailing Unicode combining marks), not raw code units.
+
+    A plain `word[i:i+n]` slice can land exactly between a base character
+    and a combining mark that is supposed to attach to it (e.g. "e" +
+    U+0301 COMBINING ACUTE ACCENT), severing them onto two different
+    render lines. Confirmed empirically (round 5 review): a 201-character
+    unbroken word with a combining acute at index 100, hard-split at
+    max_chars=100, put the bare base "e" at the end of line 0 and the
+    orphaned combining mark alone at the start of line 1; line 1 rendered
+    the mark floating with no base to attach to, and OCR read the whole
+    thing back wrong, with the accent landing on an unrelated character
+    two positions away. The split stayed byte-lossless and the suspect
+    gate still caught the corruption, so nothing shipped silently wrong,
+    but a correctly clustered split avoids manufacturing that corruption
+    in the first place.
+
+    `unicodedata.combining()` returns nonzero for any combining mark
+    regardless of script, so this works for accented Latin, Hebrew
+    niqqud, Arabic diacritics, Devanagari matras, etc, not just the Latin
+    case that triggered this fix.
+    """
+    clusters: List[str] = []
+    for ch in word:
+        if clusters and unicodedata.combining(ch):
+            clusters[-1] += ch
+        else:
+            clusters.append(ch)
+    return clusters
+
+
 def _wrap_for_render(text: str, max_chars: int = MAX_CHARS_PER_LINE) -> List[str]:
     """Wrap text into fixed-width lines without breaking words where avoidable,
     preserving existing newlines as hard breaks (so paragraph structure survives
@@ -223,8 +256,15 @@ def _wrap_for_render(text: str, max_chars: int = MAX_CHARS_PER_LINE) -> List[str
         for w in words:
             # Hard-split any word too long to ever fit on an indented line
             # by itself, regardless of what else is already on the current
-            # line - see docstring point 2 above.
-            chunks = [w[i:i + max_word_len] for i in range(0, len(w), max_word_len)] or [w]
+            # line - see docstring point 2 above. Split on grapheme
+            # clusters (_grapheme_clusters), not raw code units, so a
+            # combining mark is never separated from its base character -
+            # see that function's docstring for why.
+            clusters = _grapheme_clusters(w)
+            chunks = [
+                "".join(clusters[i:i + max_word_len])
+                for i in range(0, len(clusters), max_word_len)
+            ] or [w]
             for chunk in chunks:
                 candidate = f"{line}{'' if first_word_on_line else ' '}{chunk}"
                 if len(candidate) > max_chars and not first_word_on_line:
@@ -284,11 +324,27 @@ def _ocr(img: Image.Image) -> str:
     sorted_keys = sorted(lines, key=lambda k: tops[k])
     line_height = FONT_SIZE + LINE_SPACING
     prev_top: Optional[int] = None
-    for key in sorted_keys:
+    for idx, key in enumerate(sorted_keys):
         if prev_top is not None:
             gap = tops[key] - prev_top
             blank_count = round(gap / line_height) - 1
             out_lines.extend([""] * max(0, blank_count))
+        elif idx == 0:
+            # Leading blank render lines (before the first detected word on
+            # this page) produce no bounding box at all, so there is no
+            # "prev_top" to diff against the way the inter-line gap above
+            # does. Without this, a page that starts with one or more blank
+            # lines (e.g. the second half of a paragraph break that landed
+            # exactly on a pagination boundary) silently loses them: OCR
+            # only ever reconstructs blank lines as GAPS between two known
+            # text lines, never as a gap between the top margin and the
+            # first text line. Confirmed empirically: a page whose first
+            # render line is blank came back from _ocr() missing that line
+            # entirely, round 5 review, verified via a direct retype() call
+            # on text engineered to land a blank line at a page boundary.
+            leading_gap = tops[key] - MARGIN
+            leading_blank_count = round(leading_gap / line_height)
+            out_lines.extend([""] * max(0, leading_blank_count))
         words = sorted(lines[key], key=lambda t: t[0])
         first_left = words[0][0]
         indent = " " * max(0, round((first_left - MARGIN) / CHAR_WIDTH_PX))

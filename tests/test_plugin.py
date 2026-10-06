@@ -11,6 +11,7 @@ reintroduces one of these bugs fails loudly instead of silently shipping.
 import os
 import sys
 import time
+import unicodedata
 
 import pytest
 
@@ -46,6 +47,30 @@ def test_strips_real_html_tag():
 
 def test_strips_real_html_tag_with_attributes():
     assert plugin.sanitize_text('a <a href="https://x.com">link</a> b') == "a link b"
+
+
+def test_strips_tag_with_nested_tag_name_inside_quoted_attribute():
+    # Regression (round 5 review): a crafted attribute value embedding
+    # literal tag-like text (e.g. an onclick handler containing a quoted
+    # "<script>...</script>" string) used to stop the outer tag's match
+    # at the first "<" INSIDE the quotes, so the outer <a ...> tag never
+    # matched as a whole - only the inner "<script>"/"</script>" fake-tag
+    # substrings matched on their own and got stripped, leaving a
+    # mangled, half-stripped fragment (the outer tag's brackets and
+    # unmatched closing tag still present) behind. Confirmed empirically:
+    # this exact input used to come back as
+    # '<a href="javascript:alert(1)" onclick="document.body.innerHTML=\'x\'">click'
+    # Now the whole real tag, quoted attributes and all, is treated as
+    # one opaque unit and stripped cleanly.
+    text = (
+        '<a href="javascript:alert(1)" '
+        "onclick=\"document.body.innerHTML='<script>x</script>'\">"
+        "click</a>"
+    )
+    result = plugin.sanitize_text(text)
+    assert "<" not in result
+    assert ">" not in result
+    assert result == "click"
 
 
 def test_does_not_strip_cpp_generic_syntax():
@@ -162,6 +187,38 @@ def test_wrap_for_render_hard_split_preserves_all_characters():
     long_token = "abcdefghij" * 30  # 300 chars, no spaces
     wrapped = render_ocr._wrap_for_render(long_token, max_chars=100)
     assert "".join(wrapped) == long_token
+
+
+def test_grapheme_clusters_keeps_combining_mark_with_base():
+    # A combining mark (here U+0301 COMBINING ACUTE ACCENT) must stay
+    # attached to the base character it modifies when split into clusters,
+    # not treated as its own independent unit.
+    word = "e\u0301clair"  # "é" decomposed as e + combining acute, then "clair"
+    clusters = render_ocr._grapheme_clusters(word)
+    assert clusters[0] == "e\u0301"
+    assert "".join(clusters) == word
+
+
+def test_wrap_for_render_hard_split_does_not_sever_combining_mark():
+    # Regression (round 5 review): a plain code-unit slice (word[i:i+n])
+    # can land exactly between a base character and a combining mark that
+    # belongs to it, putting the bare base at the end of one render line
+    # and the orphaned mark alone at the start of the next. Confirmed
+    # empirically: a 201-char unbroken word with a combining acute at
+    # index 100, hard-split at max_chars=100 with the old code-unit slice,
+    # separated them onto two different lines; OCR then read the accent
+    # back attached to the wrong character entirely. No wrapped line may
+    # now end or begin with an orphaned combining mark.
+    base = "a" * 100 + "e" + "\u0301" + "a" * 99  # 201 chars total
+    wrapped = render_ocr._wrap_for_render(base, max_chars=100)
+    assert "".join(wrapped) == base
+    for line in wrapped:
+        if line:
+            # A line must never START with a combining mark (meaning its
+            # base character was left behind on the previous line).
+            assert not unicodedata.combining(line[0])
+    # The base+accent pair must survive intact somewhere, not split.
+    assert "e\u0301" in "".join(wrapped)
 
 
 def test_interior_whitespace_still_collapses():
@@ -392,6 +449,34 @@ def test_hard_cut_page_seam_preserves_word_boundary_not_newline():
             first_line_of_next_page = pages[i + 1][0]
             seam = last_line_of_page + " " + first_line_of_next_page
             assert seam in merged
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION (round 5 review): _ocr reconstructs blank lines ONLY as gaps
+# between two already-detected text lines (comparing each line's top-pixel
+# position to the previous line's). A page whose very FIRST render line is
+# blank has no "previous line" to diff against, so that leading blank line
+# was silently dropped - this can happen when a natural (non-hard-cut)
+# pagination boundary lands between two blank lines of a double-blank-line
+# run, leaving the second blank line as page N+1's first render line.
+# Fixed by measuring the gap between the page's top margin and the first
+# detected text line instead of skipping leading blanks entirely.
+# ---------------------------------------------------------------------------
+
+def test_retype_preserves_blank_line_at_page_boundary():
+    # Build text where a pagination boundary lands exactly between two
+    # blank lines: enough filler lines to hit MAX_LINES_PER_PAGE right at
+    # a blank line, followed by a second blank line, then more content.
+    # This exercises the real render+OCR round trip end-to-end, not a
+    # mocked one, since the bug is in _ocr's real reconstruction logic.
+    filler = "\n".join(f"line {i} filler text" for i in range(render_ocr.MAX_LINES_PER_PAGE - 1))
+    text = filler + "\n\nmore content after the blank"
+    result = render_ocr.retype(text)
+    assert not result.skipped
+    # The double blank line (one paragraph break) must still be exactly
+    # one paragraph break in the output - not silently collapsed to zero.
+    assert "\n\n" in result.clean_text
+    assert "more content after the blank" in result.clean_text
 
 
 # ---------------------------------------------------------------------------
