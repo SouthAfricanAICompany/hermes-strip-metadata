@@ -69,6 +69,34 @@ _HTML_TAG_PATTERN = re.compile(
     r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?:\s" + _ATTR_CONTENT + r"{0,200})?\s*/?>",
     re.IGNORECASE,
 )
+# Cleanup pass for a tag the pattern above cannot fully match: an attribute
+# value with an unterminated quote (no matching closing quote anywhere in
+# the text) has no legal way to reach the required trailing ">" within the
+# quote-balanced grammar above, so the whole tag fails to match and its
+# literal opening fragment ("<a href="unterminated...) survives verbatim,
+# even though real, well-formed tags around it DID get stripped by the
+# pattern above. Confirmed empirically (round 6 review):
+# '<a href="unterminated clicked</a> more text <b>bold</b>' sanitized to
+# '<a href="unterminated clicked more text bold' - the well-formed </a>,
+# <b>, </b> were correctly stripped, but the broken <a href="... opener
+# survived as a literal, un-neutralized "<" in text that is supposed to
+# guarantee none survive from real markup.
+#
+# Deliberately conservative about what it removes: only the bare opening
+# "<tagname" / "</tagname" token itself, nothing after it. A broader
+# match that consumed "everything up to the next < or end of line" would
+# delete real surrounding prose that has nothing to do with the broken
+# tag (e.g. "more text bold" in the repro above is legitimate content,
+# not markup, and must survive). Stripping just the opening token removes
+# the only "<" character the broken tag introduced - which is the actual
+# contract (no literal angle brackets from real markup survive) - while
+# leaving whatever attribute-like text followed it intact as harmless
+# plain text, same as any other malformed snippet sanitize_text doesn't
+# try to fully parse.
+_ORPHAN_TAG_PATTERN = re.compile(
+    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")\b",
+    re.IGNORECASE,
+)
 
 
 def sanitize_text(text: str) -> str:
@@ -92,6 +120,13 @@ def sanitize_text(text: str) -> str:
     #    paste paths (defensive; the model's plain-text output shouldn't have
     #    these, but a tool-result echo sometimes does).
     cleaned = _HTML_TAG_PATTERN.sub("", cleaned)
+
+    # 3b. Second pass: remove any orphaned tag-opener fragment left behind
+    #     by an unterminated-quote attribute that couldn't match the
+    #     quote-balanced pattern above (see _ORPHAN_TAG_PATTERN docstring).
+    #     Runs after 3 so it only ever sees openers that genuinely failed
+    #     to close, never a well-formed tag (those are already gone).
+    cleaned = _ORPHAN_TAG_PATTERN.sub("", cleaned)
 
     # 4. Collapse runs of whitespace introduced by the removals above, but
     #    preserve intentional single newlines/paragraph breaks AND leading

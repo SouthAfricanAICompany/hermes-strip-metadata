@@ -198,7 +198,24 @@ def _grapheme_clusters(word: str) -> List[str]:
     """
     clusters: List[str] = []
     for ch in word:
-        if clusters and unicodedata.combining(ch):
+        category = unicodedata.category(ch)
+        # unicodedata.combining() only returns nonzero for characters with
+        # an assigned canonical combining class, which covers Latin/Hebrew/
+        # Arabic/Devanagari diacritics but NOT every script's visually
+        # attaching mark. Confirmed empirically (round 6 review): Lao
+        # vowel sign U+0EB4 is Unicode category Mn (a real combining mark
+        # by general category) and IS present in DejaVu Sans Mono's cmap
+        # (so find_unsupported_chars never intercepts it), but
+        # unicodedata.combining("\u0EB4") == 0, so the old combining()-only
+        # check treated it as its own independent cluster and manufactured
+        # the exact severed-mark corruption this function exists to
+        # prevent, just for a script family combining() doesn't cover.
+        # Checking general category (Mn=nonspacing mark, Mc=spacing
+        # combining mark, Me=enclosing mark) instead of the narrower
+        # canonical-combining-class field covers every script whose marks
+        # visually attach to a base character, not just the ones Unicode
+        # happens to assign a nonzero combining class to.
+        if clusters and (unicodedata.combining(ch) or category in ("Mn", "Mc", "Me")):
             clusters[-1] += ch
         else:
             clusters.append(ch)

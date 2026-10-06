@@ -73,6 +73,26 @@ def test_strips_tag_with_nested_tag_name_inside_quoted_attribute():
     assert result == "click"
 
 
+def test_strips_orphaned_opener_from_unterminated_quote_attribute():
+    # Regression (round 6 review): an attribute value with an unterminated
+    # quote (no matching closing quote anywhere) has no legal way to reach
+    # the required trailing ">" within the quote-balanced pattern, so the
+    # WHOLE outer tag fails to match and its literal opening fragment
+    # survives verbatim, even though real well-formed tags around it DID
+    # get stripped. Confirmed empirically: this exact input used to come
+    # back as '<a href="unterminated clicked more text bold' - the
+    # well-formed </a>, <b>, </b> were stripped correctly, but the broken
+    # <a href="... opener survived with its literal "<" intact. The
+    # second-pass cleanup removes just the bare opening token, leaving
+    # legitimate surrounding prose ("more text bold") untouched.
+    text = '<a href="unterminated clicked</a> more text <b>bold</b>'
+    result = plugin.sanitize_text(text)
+    assert "<" not in result
+    assert ">" not in result
+    assert "more text" in result
+    assert "bold" in result
+
+
 def test_does_not_strip_cpp_generic_syntax():
     # Regression (round 3 review): a bare "anything in angle brackets" regex
     # deleted C++/Java generic type arguments. vector<int> is not HTML.
@@ -219,6 +239,29 @@ def test_wrap_for_render_hard_split_does_not_sever_combining_mark():
             assert not unicodedata.combining(line[0])
     # The base+accent pair must survive intact somewhere, not split.
     assert "e\u0301" in "".join(wrapped)
+
+
+def test_grapheme_clusters_covers_marks_outside_combining_class():
+    # Regression (round 6 review): unicodedata.combining() only returns
+    # nonzero for characters with an assigned canonical combining class,
+    # which covers Latin/Hebrew/Arabic/Devanagari diacritics but NOT every
+    # script's visually attaching mark. Lao vowel sign U+0EB4 is Unicode
+    # general category Mn (a real combining mark) and IS present in
+    # DejaVu Sans Mono's cmap (so find_unsupported_chars never intercepts
+    # it as unsupported), but unicodedata.combining("\u0EB4") == 0 - the
+    # old combining()-only check treated it as its own independent
+    # cluster, manufacturing the exact severed-mark corruption this
+    # function exists to prevent, just for a script combining() doesn't
+    # cover. Checking general category (Mn/Mc/Me) in addition to
+    # combining() closes this gap.
+    base_char = "\u0E81"
+    mark = "\u0EB4"
+    word = base_char * 100 + mark + base_char * 99  # 200 chars
+    clusters = render_ocr._grapheme_clusters(word)
+    assert mark not in clusters  # the mark must never appear as its own standalone cluster
+    wrapped = render_ocr._wrap_for_render(word, max_chars=100)
+    assert "".join(wrapped) == word
+    assert not wrapped[1].startswith(mark)
 
 
 def test_interior_whitespace_still_collapses():
@@ -449,6 +492,47 @@ def test_hard_cut_page_seam_preserves_word_boundary_not_newline():
             first_line_of_next_page = pages[i + 1][0]
             seam = last_line_of_page + " " + first_line_of_next_page
             assert seam in merged
+
+
+def test_multiple_consecutive_hard_cuts_stay_correctly_indexed():
+    # Regression-prevention (flagged, not a bug, in round 6 review): the
+    # existing hard-cut test above only exercises a single hard-cut
+    # boundary. With 3+ consecutive hard cuts in a row, hard_cut_after
+    # has multiple True entries in sequence - this test locks in that the
+    # list stays correctly indexed against `pages` (same length, each
+    # entry still lines up with the right boundary) and that the
+    # space-vs-newline join logic in retype() still produces the correct
+    # seam at every single cut, not just the first one, when there are
+    # several in a row.
+    long_para = ("alpha bravo charlie delta echo foxtrot golf hotel india " * 500).strip()
+    wrapped = render_ocr._wrap_for_render(long_para)
+    pages, hard_cut_after = render_ocr._split_into_pages(wrapped)
+    assert len(pages) == len(hard_cut_after)
+    assert len(pages) >= 4, "test fixture must be long enough to force 3+ hard cuts"
+    assert hard_cut_after.count(True) >= 3, (
+        "test fixture must actually produce 3+ consecutive hard mid-paragraph "
+        "cuts to exercise this fix, not just one"
+    )
+
+    fake_results = ["\n".join(p) for p in pages]
+    merged_parts = []
+    for i, clean in enumerate(fake_results):
+        merged_parts.append(clean)
+        if i < len(fake_results) - 1:
+            merged_parts.append(" " if hard_cut_after[i] else "\n")
+    merged = "".join(merged_parts)
+
+    # Every single hard-cut seam, not just the first, must join with
+    # exactly one space and no inserted newline.
+    for i in range(len(pages) - 1):
+        if hard_cut_after[i]:
+            seam = pages[i][-1] + " " + pages[i + 1][0]
+            assert seam in merged
+
+    # Rejoining all pages must reproduce the original word sequence
+    # exactly (no words dropped, duplicated, or reordered across any of
+    # the multiple seams).
+    assert merged.split() == long_para.split()
 
 
 # ---------------------------------------------------------------------------
