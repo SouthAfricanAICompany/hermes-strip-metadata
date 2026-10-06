@@ -6,7 +6,7 @@ Strips hidden/invisible metadata from Hermes's final response **before it reache
 
 ## Why this exists
 
-AI-generated text can carry hidden passengers you never chose to send: invisible Unicode characters used for watermarking or tracking, clipboard/RTF formatting leftovers, stray metadata that survives a copy-paste. Most people posting AI-assisted text publicly (on socials, in a company blog, in a client email) have no idea this is happening, and no easy way to check. This plugin exists to make "what you see is what gets sent" actually true, for free, for anyone, not just SAAIC's own clients. It was originally built for one person's own Hermes setup and is released here because the underlying problem affects everyone shipping AI-generated text, not a niche case.
+AI-generated text can carry hidden passengers you never chose to send: invisible Unicode characters used for watermarking or tracking, clipboard/RTF formatting leftovers, stray metadata that survives a copy-paste. Most people posting AI-assisted text publicly (on socials, in a company blog, in a client email) have no idea this is happening, and no easy way to check. This plugin exists to make "what you see is what gets sent" actually true, for free, for anyone, not just SAAIC's own clients.
 
 **A note on the best setup for public-facing use:** if you're running an agent that posts to socials or anything public-facing, the ideal setup is a dedicated Hermes harness/instance for that purpose, with this plugin enabled on it, rather than bolting it onto a general-purpose assistant you also use for fast back-and-forth chat. Stage 2's render+OCR round trip takes real time (seconds, not instant), even though it's skipped automatically for plain ASCII text and so doesn't fire on every single response. A harness dedicated to public output can afford that latency as the cost of doing it right; a harness you're also using for quick personal Q&A probably shouldn't eat it on every message.
 
@@ -72,7 +72,7 @@ Run the automated regression suite (covers every bug found across the review pro
 ```bash
 pip install pytest
 python3 -m pytest tests/test_plugin.py -v
-# should show: 29 passed
+# should show: 40 passed
 ```
 
 Ask Hermes to output something, then check the actual bytes of what you received (e.g. paste into a hex viewer or run `python3 -c "print([hex(ord(c)) for c in open('out.txt').read()])"`), there should be no characters in the `200b-200f`, `2060-2064`, `feff`, `fe00-fe0f` ranges.
@@ -99,7 +99,7 @@ OpenClaw ships the equivalent seams natively. This is NOT a Hermes-only trick:
 
 - **`message_sending`**: fires per-channel, right before delivery. `content` is mutable (last-writer-wins), or return `{ cancel: true }`. This is the direct equivalent of `transform_llm_output`: same chokepoint, just JS instead of Python.
 - **`reply_payload_sending`**: same seam but for the full normalized reply object (media, presentation, delivery), not just text. Use this if you also need to strip metadata from attachments/media refs, not only text.
-- **`before_response_emit`** (newer, as of the PR introducing it), run-scoped, closer to Hermes's `transform_llm_output` in spirit (fires once per run on the assistant's final text, with `allContent`/`content` returns and a `block` option). **Caveat found in the PR review**: as shipped it fails OPEN on a hook crash (unmodified text still gets delivered). If the friend uses this hook for metadata stripping, wrap the sanitizer body in its own try/except and fail closed (block the reply) rather than trusting the host's default error handling.
+- **`before_response_emit`** (newer, as of the PR introducing it), run-scoped, closer to Hermes's `transform_llm_output` in spirit (fires once per run on the assistant's final text, with `allContent`/`content` returns and a `block` option). **Caveat found in the PR review**: as shipped it fails OPEN on a hook crash (unmodified text still gets delivered). If you use this hook for metadata stripping, wrap the sanitizer body in its own try/except and fail closed (block the reply) rather than trusting the host's default error handling.
 
 A minimal OpenClaw plugin doing the same job:
 
@@ -115,7 +115,7 @@ export default definePluginEntry({
 });
 ```
 
-Same sanitize function, same guarantee (runs before every channel send, not model-dependent), ported to the host's native hook instead of Hermes's. The friend's own agent can read OpenClaw's `docs.openclaw.ai/plugins/hooks` and implement this directly. It's documented, stable API, not a reverse-engineered internal.
+Same sanitize function, same guarantee (runs before every channel send, not model-dependent), ported to the host's native hook instead of Hermes's. Read OpenClaw's `docs.openclaw.ai/plugins/hooks` to implement this directly on that platform. It's documented, stable API, not a reverse-engineered internal.
 
 ## About SAAIC
 

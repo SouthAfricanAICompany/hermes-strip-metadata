@@ -1,9 +1,9 @@
 """Regression test suite for hermes-strip-metadata.
 
-Covers every bug found across the 3 independent review rounds (Tom, Forge,
-Anvil in Paperclip's SAAIC board), plus the 3 post-ship engineering
-improvements (test suite itself, font caching/cross-platform resolution,
-ASCII cost gate). Run with: pytest tests/test_plugin.py -v
+Covers every bug found across 3 independent internal review rounds, plus
+the engineering improvements that followed (test suite itself, font
+caching/cross-platform resolution, ASCII cost gate). Run with:
+pytest tests/test_plugin.py -v
 
 Each test names the specific regression it guards so a future change that
 reintroduces one of these bugs fails loudly instead of silently shipping.
@@ -75,7 +75,7 @@ def test_leaves_plain_prose_untouched():
 
 
 # ---------------------------------------------------------------------------
-# REGRESSION 1 (round 1, found independently by Tom/Forge/Anvil):
+# REGRESSION 1 (round 1, found independently during internal review):
 # sanitize_text's whitespace-collapse regex was destroying leading
 # indentation on every line, corrupting code blocks and nested markdown
 # lists. Fixed by only collapsing INTERIOR whitespace, never leading.
@@ -135,7 +135,7 @@ def test_interior_whitespace_still_collapses():
 
 
 # ---------------------------------------------------------------------------
-# REGRESSION 2 (round 2, found by Tom): the OCR suspect-detection gate only
+# REGRESSION 2 (round 2): the OCR suspect-detection gate only
 # flagged non-ASCII character damage, missing pure-ASCII syntax corruption
 # like a mangled code fence marker. Fixed by _has_structural_damage, which
 # flags ANY non-whitespace change regardless of character set.
@@ -162,7 +162,7 @@ def test_structural_damage_false_on_cosmetic_stray_space():
 
 
 # ---------------------------------------------------------------------------
-# REGRESSION 3 (round 2, found by Tom): pagination (_split_into_pages)
+# REGRESSION 3 (round 2): pagination (_split_into_pages)
 # counted raw source lines instead of post-wrap render lines, so a single
 # long paragraph (one source line, many render lines after word-wrap)
 # bypassed the page-size cap entirely and rendered as one oversized image.
@@ -195,7 +195,7 @@ def test_regression_multi_paragraph_paste_respects_page_cap():
 
 
 # ---------------------------------------------------------------------------
-# REGRESSION 4 (round 3, found by Tom): _has_structural_damage ignored
+# REGRESSION 4 (round 3): _has_structural_damage ignored
 # whitespace-only diffs entirely, so OCR silently changing an 8-space
 # indent to 4-space indent (pure whitespace, but changes Python/YAML
 # meaning) scored a high similarity ratio and passed as not-suspect. Fixed
@@ -218,9 +218,9 @@ def test_indentation_check_does_not_false_positive_on_cosmetic_whitespace():
 
 # ---------------------------------------------------------------------------
 # Post-ship improvement: font resolution must work across the OSes this
-# plugin is promoted for (Jason: "there are also users going to use this
-# on windows machines"). Not a live Windows test (no Windows host
-# available), but confirms the resolver logic is OS-aware and fails safe.
+# plugin is promoted for (some users run on Windows machines). Not a live
+# Windows test (no Windows host available), but confirms the resolver
+# logic is OS-aware and fails safe.
 # ---------------------------------------------------------------------------
 
 def test_font_resolved_on_this_host():
