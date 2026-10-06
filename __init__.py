@@ -33,6 +33,28 @@ _SUSPICIOUS_LOOKALIKES = {
     "\u2010": "-",  # hyphen variants -> ascii hyphen (optional; keep conservative)
 }
 
+# Real HTML tag names only. A bare "anything in angle brackets" regex is not
+# conservative: it also matches C++/Java generics (vector<int>), comparison
+# chains (if (a < b) and (c > d)), and angle-bracket email addresses
+# (<nobody@example.com>), silently deleting content that was never HTML.
+# Matching against an actual tag-name whitelist (plus a required boundary
+# right after the name: whitespace, "/", or ">") excludes all three of
+# those cases while still catching the real stray-HTML-tag leaks this check
+# exists for. Case-insensitive, since HTML tag names are.
+_HTML_TAG_NAMES = (
+    "a abbr address area article aside audio b base bdi bdo blockquote body br button "
+    "canvas caption cite code col colgroup data datalist dd del details dfn dialog div dl dt "
+    "em embed fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 head header hr html i "
+    "iframe img input ins kbd label legend li link main map mark menu meta meter nav noscript "
+    "object ol optgroup option output p param picture pre progress q rp rt ruby s samp script "
+    "section select slot small source span strong style sub summary sup table tbody td "
+    "template textarea tfoot th thead time title tr track u ul var video wbr"
+).split()
+_HTML_TAG_PATTERN = re.compile(
+    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?:\s[^<>\n]{0,200})?\s*/?>",
+    re.IGNORECASE,
+)
+
 
 def sanitize_text(text: str) -> str:
     """Strip invisible/watermarking characters and normalize whitespace.
@@ -54,7 +76,7 @@ def sanitize_text(text: str) -> str:
     # 3. Strip any stray HTML tags that sometimes leak through clipboard/RTF
     #    paste paths (defensive; the model's plain-text output shouldn't have
     #    these, but a tool-result echo sometimes does).
-    cleaned = re.sub(r"<[^>\n]{1,200}>", "", cleaned)
+    cleaned = _HTML_TAG_PATTERN.sub("", cleaned)
 
     # 4. Collapse runs of whitespace introduced by the removals above, but
     #    preserve intentional single newlines/paragraph breaks AND leading

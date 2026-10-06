@@ -40,6 +40,35 @@ def test_strips_variation_selectors():
     assert "\ufe0f" not in plugin.sanitize_text("test\ufe0f")
 
 
+def test_strips_real_html_tag():
+    assert plugin.sanitize_text("hello<b>world</b>") == "helloworld"
+
+
+def test_strips_real_html_tag_with_attributes():
+    assert plugin.sanitize_text('a <a href="https://x.com">link</a> b') == "a link b"
+
+
+def test_does_not_strip_cpp_generic_syntax():
+    # Regression (round 3 review): a bare "anything in angle brackets" regex
+    # deleted C++/Java generic type arguments. vector<int> is not HTML.
+    text = "Use vector<int> for a dynamic array."
+    assert plugin.sanitize_text(text) == text
+
+
+def test_does_not_strip_comparison_chain():
+    # Regression (round 3 review): "if (a < b) and (c > d)" is program
+    # logic, not an HTML tag, and must survive unchanged.
+    text = "if (a < b) and (c > d): pass"
+    assert plugin.sanitize_text(text) == text
+
+
+def test_does_not_strip_angle_bracket_email():
+    # Regression (round 3 review): <nobody@example.com> is a common
+    # angle-bracket email address format, not HTML, and must survive.
+    text = "email me at <nobody@example.com> please"
+    assert plugin.sanitize_text(text) == text
+
+
 def test_leaves_plain_prose_untouched():
     text = "The quick brown fox jumps over the lazy dog."
     assert plugin.sanitize_text(text) == text
@@ -70,6 +99,31 @@ def test_regression_nested_markdown_list_preserved():
 def test_regression_eight_space_indent_preserved():
     text = "if True:\n        deeply_nested_call()\n"
     assert plugin.sanitize_text(text) == text
+
+
+def test_wrap_for_render_preserves_tab_indent_as_expanded_spaces():
+    # Regression (round 3 review): leading-whitespace detection in
+    # _wrap_for_render only recognized " " (space), not "\t" (tab), so a
+    # tab-indented line measured zero leading whitespace and the tab byte
+    # got folded into the first "word" instead of being treated as indent.
+    # Tabs are expanded to spaces (4-space stop) rather than passed through
+    # raw, since PIL has no reliable tab-stop rendering and the OCR-side
+    # indent reconstruction always rebuilds indentation in space units.
+    wrapped = render_ocr._wrap_for_render("\tdef foo():")
+    assert wrapped == ["    def foo():"]
+    assert "\t" not in wrapped[0]
+
+
+def test_wrap_for_render_tab_indent_survives_word_wrap():
+    # The original failure mode: a long tab-indented paragraph that must
+    # wrap across multiple render lines. Every wrapped line must carry the
+    # same (expanded) indent, with no tab character or corrupted first word.
+    long_line = "\t" + ("word " * 40).strip()
+    wrapped = render_ocr._wrap_for_render(long_line)
+    assert len(wrapped) > 1
+    for line in wrapped:
+        assert line.startswith("    ")
+        assert "\t" not in line
 
 
 def test_interior_whitespace_still_collapses():

@@ -184,8 +184,19 @@ def _wrap_for_render(text: str, max_chars: int = MAX_CHARS_PER_LINE) -> List[str
         if not paragraph:
             out.append("")
             continue
-        leading_ws_len = len(paragraph) - len(paragraph.lstrip(" "))
-        indent = paragraph[:leading_ws_len]
+        leading_ws_len = len(paragraph) - len(paragraph.lstrip(" \t"))
+        raw_indent = paragraph[:leading_ws_len]
+        # Expand tabs to spaces before use: PIL's ImageDraw has no reliable,
+        # consistent tab-stop behavior, and the OCR-side indent reconstruction
+        # (_ocr, below) always rebuilds indentation as spaces measured in
+        # CHAR_WIDTH_PX units regardless of what was in the original text. A
+        # raw tab character surviving into `indent` would either render as a
+        # stray/invisible glyph or (worse) get treated as part of the first
+        # word when wrapping, corrupting the text. Expanding up front keeps
+        # wrapping and indent math consistent for tab- and space-indented
+        # input alike. Standard 4-space tab stop (also what render_ocr can
+        # only reproduce anyway, since OCR cannot recover an actual \t byte).
+        indent = raw_indent.expandtabs(4)
         words = paragraph[leading_ws_len:].split(" ")
         line = indent
         first_word_on_line = True
