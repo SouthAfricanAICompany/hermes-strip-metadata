@@ -1,0 +1,450 @@
+"""render_ocr.py: 'retype' an AI-generated string by rendering it to a bitmap and
+reading it back via OCR, producing a string with zero lineage to the original
+text object (no clipboard flavors, no invisible Unicode, no HTML/RTF wrapper,
+no hidden characters of any kind: OCR physically cannot see what isn't ink on
+the page).
+
+This is the API-delivery equivalent of a human retyping text on a keyboard.
+It does NOT defeat a statistical (word-choice) watermark - the words that come
+back out are the same words that went in. Pair with a paraphraser for that.
+
+Public entrypoint: retype(text) -> (clean_text, diff_report)
+"""
+
+from __future__ import annotations
+
+import difflib
+import io
+import os
+import platform
+import re
+import warnings
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+from PIL import Image, ImageDraw, ImageFont
+from fontTools.ttLib import TTFont
+import pytesseract
+
+# Font path resolution: a monospace font with a known, fixed glyph width is
+# required (CHAR_WIDTH_PX below depends on it), and it must be present on
+# the host without requiring the end user to hunt for one. Checked in order;
+# first match wins. HERMES_STRIP_METADATA_FONT overrides everything (set it
+# if none of these paths exist on your system, e.g. a minimal Docker image
+# or a Windows install without the bundled fallback below).
+_FONT_CANDIDATES = [
+    os.environ.get("HERMES_STRIP_METADATA_FONT"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",  # Debian/Ubuntu
+    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",            # Fedora/RHEL
+    "/usr/local/share/fonts/DejaVuSansMono.ttf",             # manual install, any Linux
+    "/opt/homebrew/share/fonts/DejaVuSansMono.ttf",          # macOS (Apple Silicon Homebrew)
+    "/usr/local/share/fonts/DejaVuSansMono.ttf",             # macOS (Intel Homebrew)
+    "C:\\Windows\\Fonts\\consola.ttf",                        # Windows: Consolas (near-universal since Vista)
+    "C:\\Windows\\Fonts\\cour.ttf",                           # Windows: Courier New (always present, fallback)
+]
+
+
+def _resolve_font_path() -> str:
+    for candidate in _FONT_CANDIDATES:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "hermes-strip-metadata: no monospace font found at any known path "
+        "for this OS (checked: " + ", ".join(c for c in _FONT_CANDIDATES if c) + "). "
+        "Set HERMES_STRIP_METADATA_FONT to a .ttf path on this machine. "
+        "Stage 2 (render-OCR) cannot run without a font and will be skipped "
+        "(falls back to stage-1 output only) until this is set."
+    )
+
+
+try:
+    FONT_PATH = _resolve_font_path()
+except FileNotFoundError as _font_err:
+    # Fail loud, not silent: a missing font used to mean every call quietly
+    # degraded to stage-1-only with no visible signal anyone would notice.
+    # Warn once at import time, then let callers keep working (retype()
+    # below re-raises into the same fallback path, intentionally).
+    warnings.warn(str(_font_err), RuntimeWarning, stacklevel=2)
+    FONT_PATH = None
+
+FONT_SIZE = 28
+LINE_SPACING = 8
+MARGIN = 20
+CHAR_WIDTH_PX = 17  # approx for DejaVu Sans Mono / Consolas at size 28; used to size the canvas
+MAX_CHARS_PER_LINE = 100
+
+# Large pastes are paginated rather than rendered as one tall image: OCR
+# accuracy degrades on very tall images, and a single huge render is slow
+# and hard to debug. Each page is rendered/OCR'd/diffed independently, then
+# stitched back together in original order.
+MAX_LINES_PER_PAGE = 60
+
+# Cache the parsed font + cmap at module load instead of re-parsing the
+# font file from disk on every retype() call. TTFont() is not free (it
+# parses the whole font file), and find_unsupported_chars() previously ran
+# it on every single call regardless of input size.
+_CMAP_CACHE: Optional[dict] = None
+
+
+def _get_cmap() -> dict:
+    global _CMAP_CACHE
+    if _CMAP_CACHE is None:
+        if not FONT_PATH:
+            raise FileNotFoundError("no font available; see warning at import time")
+        tt = TTFont(FONT_PATH)
+        _CMAP_CACHE = tt.getBestCmap()
+    return _CMAP_CACHE
+
+
+def find_unsupported_chars(text: str, font_path: Optional[str] = None) -> List[str]:
+    """Return the sorted set of characters in `text` that the render font has
+    no glyph for (emoji, CJK, most non-Latin scripts in a Latin monospace
+    font, etc), checked against the font's actual cmap table.
+
+    A bounding-box check on the rendered glyph is NOT sufficient here: most
+    fonts draw a visible "tofu" fallback box for codepoints they don't
+    support, which has a non-empty bbox and would be indistinguishable from
+    a real glyph by that test alone. The cmap is the authoritative source.
+
+    Any unsupported character means retyping would corrupt the text (either
+    render as a tofu box that OCR misreads, or get silently dropped), the
+    caller should skip the round trip for this input rather than risk it.
+
+    The cmap is parsed once at module import and cached (see `_get_cmap`)
+    rather than re-parsed from disk on every call - font files are not
+    huge, but there is no reason to re-read and re-decode one on every
+    single response that passes through this hook.
+    """
+    cmap = _get_cmap() if font_path is None else TTFont(font_path).getBestCmap()
+    bad = set()
+    for ch in set(text):
+        if ch.isspace():
+            continue
+        if ord(ch) not in cmap:
+            bad.add(ch)
+    return sorted(bad)
+
+
+@dataclass
+class RetypeResult:
+    clean_text: str
+    original_text: str
+    diff_ratio: float
+    diff_lines: List[str] = field(default_factory=list)
+    suspect: bool = False
+    skipped: bool = False
+    skip_reason: str = ""
+    char_damage: List[str] = field(default_factory=list)
+
+
+def _wrap_for_render(text: str, max_chars: int = MAX_CHARS_PER_LINE) -> List[str]:
+    """Wrap text into fixed-width lines without breaking words where avoidable,
+    preserving existing newlines as hard breaks (so paragraph structure survives
+    the round trip) AND preserving leading whitespace/indentation per source
+    line (critical for code blocks: OCR round-trips must not silently change
+    what the text means).
+    """
+    out: List[str] = []
+    for paragraph in text.split("\n"):
+        if not paragraph:
+            out.append("")
+            continue
+        leading_ws_len = len(paragraph) - len(paragraph.lstrip(" "))
+        indent = paragraph[:leading_ws_len]
+        words = paragraph[leading_ws_len:].split(" ")
+        line = indent
+        first_word_on_line = True
+        for w in words:
+            candidate = f"{line}{'' if first_word_on_line else ' '}{w}"
+            if len(candidate) > max_chars and not first_word_on_line:
+                out.append(line)
+                line = f"{indent}{w}"
+                first_word_on_line = False
+            else:
+                line = candidate
+                first_word_on_line = False
+        out.append(line)
+    return out
+
+
+def _render_lines(lines: List[str]) -> Image.Image:
+    font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+    line_height = FONT_SIZE + LINE_SPACING
+    width = MARGIN * 2 + MAX_CHARS_PER_LINE * CHAR_WIDTH_PX
+    height = MARGIN * 2 + line_height * max(len(lines), 1)
+
+    img = Image.new("L", (width, height), color=255)  # white background, grayscale
+    draw = ImageDraw.Draw(img)
+    y = MARGIN
+    for line in lines:
+        draw.text((MARGIN, y), line, fill=0, font=font)
+        y += line_height
+    return img
+
+
+def _ocr(img: Image.Image) -> str:
+    """OCR via word-level bounding boxes rather than plain image_to_string.
+
+    Plain string OCR discards leading whitespace per line (not visible
+    "content" to a text recognizer), which would silently destroy code
+    indentation on the round trip. Reconstructing indentation from each
+    line's first word's pixel x-offset (which we control, since we rendered
+    the image) recovers it exactly.
+    """
+    config = "--psm 6"
+    data = pytesseract.image_to_data(img, config=config, output_type=pytesseract.Output.DICT)
+
+    # tesseract's line_num resets per block/paragraph, so the sort key must be
+    # the full (block_num, par_num, line_num) tuple plus top-pixel position,
+    # not line_num alone - otherwise lines from different blocks collide and
+    # get merged out of order.
+    lines: dict[tuple[int, int, int], list[tuple[int, str]]] = {}
+    tops: dict[tuple[int, int, int], int] = {}
+    for i in range(len(data["text"])):
+        word = data["text"][i]
+        if not word.strip():
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        left = data["left"][i]
+        lines.setdefault(key, []).append((left, word))
+        tops[key] = data["top"][i]
+
+    out_lines = []
+    sorted_keys = sorted(lines, key=lambda k: tops[k])
+    line_height = FONT_SIZE + LINE_SPACING
+    prev_top: Optional[int] = None
+    for key in sorted_keys:
+        if prev_top is not None:
+            gap = tops[key] - prev_top
+            blank_count = round(gap / line_height) - 1
+            out_lines.extend([""] * max(0, blank_count))
+        words = sorted(lines[key], key=lambda t: t[0])
+        first_left = words[0][0]
+        indent = " " * max(0, round((first_left - MARGIN) / CHAR_WIDTH_PX))
+        out_lines.append(indent + " ".join(w for _, w in words))
+        prev_top = tops[key]
+
+    return "\n".join(out_lines)
+
+
+def _postprocess_ocr(raw: str) -> str:
+    """Undo wrapping artifacts: collapse the hard line-wraps we introduced for
+    rendering back into the natural paragraph flow, while preserving blank
+    lines (paragraph breaks) and intentional single newlines are NOT
+    reconstructed perfectly here - by design, since we can't know which
+    newlines were "real" vs render-wrap without a marker. See note in README.
+    """
+    # Tesseract tends to leave trailing whitespace; normalize line endings.
+    lines = [l.rstrip() for l in raw.split("\n")]
+    # Drop a possible trailing blank line OCR appends.
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _char_level_damage(original: str, ocr_text: str, max_report: int = 10) -> List[str]:
+    """Report individual character substitutions the OCR round trip made,
+    independent of the aggregate similarity ratio. A high overall ratio can
+    hide a small number of semantically important substitutions (e.g.
+    accented letters silently flattened to their ASCII equivalent by the OCR
+    engine, even though the font rendered the correct glyph) - this walks
+    the actual diff opcodes and surfaces every 'replace' span so the caller
+    can see what specifically changed, not just how much. Capped at
+    `max_report` entries for readability; see `_has_structural_damage` for
+    the uncapped safety check used as the actual suspect gate.
+    """
+    sm = difflib.SequenceMatcher(None, original, ocr_text)
+    reports = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "replace" and len(reports) < max_report:
+            reports.append(f"{original[i1:i2]!r} -> {ocr_text[j1:j2]!r}")
+    return reports
+
+
+def _has_structural_damage(original: str, ocr_text: str) -> bool:
+    """True if the OCR round trip changed, deleted, or inserted any
+    non-whitespace content, OR changed the leading indentation of any line
+    - not capped by `max_report`, not limited to non-ASCII characters.
+
+    Two separate checks, deliberately:
+    1. Non-whitespace changes (as before): a damaging edit can be pure
+       ASCII (a fence marker like three backticks mangled into something
+       else, or dropped entirely) and still score an aggregate diff_ratio
+       above 0.9, so ratio alone is not a safe gate for structured/code
+       content.
+    2. Leading-indentation changes, even when every changed character is
+       whitespace: confirmed empirically (independent review) that OCR can
+       silently turn an 8-space indent into 4-space, which still scores
+       ratio 0.86-0.97 and is pure whitespace, yet changes what the code
+       means (Python nesting, YAML structure, etc). A generic
+       whitespace-only diff elsewhere (e.g. tesseract inserting a stray
+       space between two words, which is genuinely cosmetic) is NOT
+       flagged by this second check - only a change to a line's OWN
+       leading-indent run counts, since that is the only whitespace
+       category that is reliably structural rather than cosmetic.
+    """
+    sm = difflib.SequenceMatcher(None, original, ocr_text)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        changed = original[i1:i2] + ocr_text[j1:j2]
+        if changed.strip():
+            return True
+
+    def _leading_whitespace(line: str) -> str:
+        match = re.match(r"[ \t]*", line)
+        return match.group(0) if match else ""
+
+    orig_lines = original.split("\n")
+    ocr_lines = ocr_text.split("\n")
+    if len(orig_lines) == len(ocr_lines):
+        for o_line, c_line in zip(orig_lines, ocr_lines):
+            if _leading_whitespace(o_line) != _leading_whitespace(c_line):
+                return True
+
+    return False
+
+
+def _retype_page(render_lines: List[str], diff_threshold: float) -> RetypeResult:
+    """Render/OCR a single page of already-wrapped lines (wrapping and
+    pagination both happen once, up front, in retype())."""
+    img = _render_lines(render_lines)
+    raw_ocr = _ocr(img)
+    clean = _postprocess_ocr(raw_ocr)
+
+    # Compare against the *wrapped* original (same line breaks) for a fair diff,
+    # not the pre-wrap original which has different newline positions.
+    wrapped_original = "\n".join(render_lines)
+    ratio = difflib.SequenceMatcher(None, wrapped_original, clean).ratio()
+
+    diff_lines = list(
+        difflib.unified_diff(
+            wrapped_original.splitlines(),
+            clean.splitlines(),
+            lineterm="",
+            n=1,
+        )
+    )
+
+    char_damage = _char_level_damage(wrapped_original, clean)
+    # Reject ANY structural damage (not just non-ASCII replacements): a
+    # damaging edit can be pure ASCII - e.g. a code fence marker mangled or
+    # dropped - and still score an aggregate ratio above threshold. Ratio
+    # alone is not a safe gate for structured/code content; see
+    # _has_structural_damage for why.
+    structural_damage = _has_structural_damage(wrapped_original, clean)
+
+    return RetypeResult(
+        clean_text=clean,
+        original_text=wrapped_original,
+        diff_ratio=ratio,
+        diff_lines=diff_lines,
+        suspect=(ratio < diff_threshold) or structural_damage,
+        char_damage=char_damage,
+    )
+
+
+def _split_into_pages(render_lines: List[str], max_lines: int = MAX_LINES_PER_PAGE) -> List[List[str]]:
+    """Split already-wrapped render lines into page-sized chunks on
+    blank-line (paragraph) boundaries where possible, falling back to a
+    hard line-count cut if a single paragraph alone exceeds max_lines.
+
+    Must operate on WRAPPED lines, not raw source lines: a single long
+    paragraph is one source line but many render lines once word-wrapped to
+    MAX_CHARS_PER_LINE, and it's the render-line count that drives OCR
+    image height (confirmed empirically: a 6900-character single paragraph
+    passed the old raw-line check trivially since it was one source line,
+    then rendered as a single ~70-line image, well past the 60-line
+    reliability ceiling this function exists to enforce).
+    """
+    if len(render_lines) <= max_lines:
+        return [render_lines]
+
+    pages: List[List[str]] = []
+    current: List[str] = []
+    for line in render_lines:
+        current.append(line)
+        at_blank_boundary = line.strip() == ""
+        if len(current) >= max_lines and at_blank_boundary:
+            pages.append(current)
+            current = []
+        elif len(current) >= max_lines:
+            # No blank line at exactly max_lines: cut here rather than
+            # waiting for one, so a page is never more than max_lines long
+            # regardless of paragraph structure.
+            pages.append(current)
+            current = []
+    if current:
+        pages.append(current)
+    return pages
+
+
+def retype(text: str, diff_threshold: float = 0.90) -> RetypeResult:
+    """Render `text` to a bitmap, OCR it back, and return the OCR'd string plus
+    a diff report against the original. If similarity falls below
+    `diff_threshold`, `suspect=True` is set so the caller can decide to fall
+    back to the original text rather than risk a garbled OCR read silently
+    going out.
+
+    If `text` contains characters the render font can't draw (emoji, CJK,
+    most non-Latin scripts), the round trip is skipped entirely and the
+    original text is returned unchanged with `skipped=True`: silently
+    rendering those as tofu boxes and OCR-guessing them back would corrupt
+    meaning-bearing content, and an aggregate similarity ratio over a long
+    string is not sensitive enough to catch that kind of concentrated,
+    small-character-count damage (confirmed empirically: an emoji-corrupting
+    round trip can still score ratio > 0.9).
+
+    Large input is paginated internally (see MAX_LINES_PER_PAGE): each page
+    is rendered/OCR'd/diffed independently and the results are merged, so a
+    long paste behaves the same as many small calls rather than one huge,
+    OCR-unreliable image.
+    """
+    if not text or not text.strip():
+        return RetypeResult(clean_text=text, original_text=text, diff_ratio=1.0)
+
+    if not FONT_PATH:
+        # No usable font on this host (see the warning emitted at import
+        # time) - skip the round trip entirely rather than crashing. The
+        # caller falls back to stage-1-only output, same as the
+        # unsupported-character path below.
+        return RetypeResult(
+            clean_text=text,
+            original_text=text,
+            diff_ratio=1.0,
+            skipped=True,
+            skip_reason="no monospace font found on this host; set HERMES_STRIP_METADATA_FONT",
+        )
+
+    unsupported = find_unsupported_chars(text)
+    if unsupported:
+        return RetypeResult(
+            clean_text=text,
+            original_text=text,
+            diff_ratio=1.0,
+            skipped=True,
+            skip_reason=f"font cannot render: {' '.join(unsupported)}",
+        )
+
+    pages = _split_into_pages(_wrap_for_render(text))
+    if len(pages) == 1:
+        return _retype_page(pages[0], diff_threshold)
+
+    results = [_retype_page(p, diff_threshold) for p in pages]
+    merged_clean = "\n".join(r.clean_text for r in results)
+    merged_diff_lines: List[str] = []
+    merged_char_damage: List[str] = []
+    for i, r in enumerate(results):
+        merged_diff_lines.extend(r.diff_lines)
+        merged_char_damage.extend(r.char_damage)
+    avg_ratio = sum(r.diff_ratio for r in results) / len(results)
+    any_suspect = any(r.suspect for r in results)
+
+    return RetypeResult(
+        clean_text=merged_clean,
+        original_text=text,
+        diff_ratio=avg_ratio,
+        diff_lines=merged_diff_lines,
+        suspect=any_suspect,
+        char_damage=merged_char_damage,
+    )

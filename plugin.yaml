@@ -1,0 +1,17 @@
+name: strip-metadata
+version: "2.0"
+description: >
+  Sanitizes the agent's final response before it reaches ANY destination
+  (chat UI, Telegram, cron delivery, API, etc). Stage 1 strips invisible
+  zero-width unicode and stray HTML/RTF artifacts. Stage 2 renders the text
+  to a bitmap and OCRs it back, the API-delivery equivalent of physically
+  retyping it, so outgoing text carries no clipboard or formatting lineage
+  back to the model's output buffer. Falls back safely for text the OCR
+  round trip can't handle cleanly (emoji, CJK, low-confidence reads).
+python_dependencies:
+  - Pillow
+  - pytesseract
+  - fonttools
+author: "SAAIC (South African AI Company), https://saaic.co.za"
+license: MIT
+homepage: "https://github.com/saaic/hermes-strip-metadata"
