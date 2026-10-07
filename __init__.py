@@ -42,20 +42,50 @@ _INVISIBLE_PATTERN = re.compile(
     "]"
 )
 
-# Emoji-ish codepoint ranges: Misc Symbols/Dingbats (U+2600-27BF) plus the
-# whole supplementary emoji/pictograph/symbol plane (U+1F000-1FFFF, covers
-# emoticons, transport, symbols & pictographs, skin-tone modifiers, etc.).
-# Used only to decide whether a ZWJ sits between two real emoji (keep it,
-# it's load-bearing) vs. between ordinary text (strip it, likely stego).
-_EMOJI_ISH = re.compile(r"[\u2600-\u27bf\U0001f000-\U0001ffff]")
+# Characters that commonly serve as the BASE of a real Unicode ZWJ emoji
+# sequence (per Unicode's own emoji-zwj-sequences.txt): the "people" block
+# (man/woman/boy/girl and their many profession/hair/feature variants),
+# plus the small set of symbols known to appear on the far side of a ZWJ in
+# documented sequences (medical symbol, heart, airplane, gender symbols,
+# rainbow, flag base, kiss mark, etc). Deliberately curated and narrow,
+# NOT "any codepoint in the whole emoji plane" - see round 8 review below
+# for why the broad version was unsafe.
+#
+# Round 8 review found the original _EMOJI_ISH check (any codepoint in
+# U+2600-27BF or U+1F000-1FFFF) was far too permissive: it only required
+# that SOME symbol sit on each side of the ZWJ, not that the two symbols
+# actually form a real, documented compound-emoji relationship. Confirmed
+# empirically: sanitize_text("\u2714\u200d\u2605") (heavy check mark + ZWJ
+# + black star - not a defined emoji sequence) used to keep the ZWJ
+# untouched, because both neighbors happen to fall in the dingbat range.
+# That is the exact steganographic payload this function exists to strip,
+# surviving because an attacker can pick any two symbols from a huge
+# range rather than needing a real emoji pair. Narrowing the check to
+# only the codepoints that actually appear as ZWJ-sequence components
+# closes that gap while still preserving every real compound emoji this
+# plugin has been tested against (family emoji, woman health worker).
+_ZWJ_JOINABLE = re.compile(
+    "["
+    "\U0001f466-\U0001f487"  # boy..person-with-blond-hair (core "people" base range)
+    "\U0001f9b0-\U0001f9ff"  # supplemental people/body features (red hair, beard, etc.)
+    "\U0001f3f3"             # white flag (rainbow-flag ZWJ sequences)
+    "\U0001f308"             # rainbow
+    "\U0001f48b"             # kiss mark (kiss ZWJ sequences)
+    "\u2695"                 # medical symbol (health worker sequences)
+    "\u2696"                 # scales (judge sequences)
+    "\u2708"                 # airplane (pilot sequences)
+    "\u2764"                 # heavy black heart (couple/kiss sequences)
+    "\u2640\u2642"           # female/male signs (gendered-profession sequences)
+    "\u2620"                 # skull and crossbones (pirate sequences)
+    "]"
+)
 
 
 def _strip_watermark_zwj(text: str) -> str:
-    """Remove ZWJ (U+200D) everywhere EXCEPT where it joins two emoji-ish
-    characters, where it is the real glue holding a compound emoji
-    together and removing it corrupts visible content rather than
-    defeating any watermark (see _INVISIBLE_PATTERN's docstring above for
-    the empirical repro)."""
+    """Remove ZWJ (U+200D) everywhere EXCEPT where it joins two characters
+    that actually appear as components of a real, documented Unicode ZWJ
+    emoji sequence (see `_ZWJ_JOINABLE`'s docstring for why this is
+    narrower than "any emoji-ish symbol")."""
     if "\u200d" not in text:
         return text
 
@@ -63,7 +93,7 @@ def _strip_watermark_zwj(text: str) -> str:
         idx = m.start()
         before = text[idx - 1] if idx > 0 else ""
         after = text[idx + 1] if idx + 1 < len(text) else ""
-        if _EMOJI_ISH.match(before) and _EMOJI_ISH.match(after):
+        if _ZWJ_JOINABLE.match(before) and _ZWJ_JOINABLE.match(after):
             return m.group(0)
         return ""
 
@@ -194,35 +224,71 @@ def _strip_html_tags(text: str) -> str:
 # "orphan opener", even though it was never a broken tag to begin with.
 # Confirmed empirically: "results show x<a and y>b, so x<a<b is false
 # when b<a" - after _strip_html_tags correctly left it alone, this pass
-# still deleted the lone "<a" token. Fixed by requiring an "=" to appear
-# somewhere between the match and either the next "<"/end-of-line,
-# matching the same intuition: a genuine broken-tag opener is followed
-# by attribute-like text (href="..., src=...), while a comparison/code
-# false positive is followed by plain words and no "=" at all.
+# still deleted the lone "<a" token. Round 7's fix required an "=" to
+# appear ANYWHERE between the match and the next "<"/end-of-line - but
+# round 8 review found that's too loose: a real "=" belonging to
+# unrelated prose much later on the same line can make a genuinely
+# harmless "<tagname" look like it has attributes. Confirmed empirically:
+# "<b the result is x=y so it stands alone" used to come back with the
+# harmless "<b" deleted, purely because an unrelated "x=y" appeared many
+# words later on the same line, nowhere near the tag token.
+#
+# Fixed by requiring the "=" to belong to the FIRST word immediately
+# after the tag name (after optional whitespace) - i.e. the shape of a
+# real attribute, "<a href=...", "<a   data-x=...", not just "some '='
+# exists somewhere further down the line". A genuine broken tag's first
+# attribute is adjacent to the tag name; a comparison/code false positive
+# has ordinary words in between with no "=" directly attached to any of
+# them.
+_ORPHAN_ATTR_PATTERN = re.compile(r"\s+[^\s<>=]+\s*=")
 _ORPHAN_TAG_PATTERN = re.compile(
     r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")\b",
     re.IGNORECASE,
 )
 
+# Round 8 review also found the backtick-code-span guard below is
+# per-line only and has no notion of a TRIPLE-backtick fenced block
+# spanning multiple lines (``` ... ```), as opposed to a single-line
+# `inline code span`. Confirmed empirically: an "<a href=..." example
+# deliberately placed on an interior line of a fenced code block (that
+# specific line itself has zero backticks on it, so the per-line odd/even
+# count saw it as "not inside a span") still got its "<a" stripped,
+# destroying a documentation example the fence exists to preserve
+# verbatim. Fixed by tracking fence state across the whole text first:
+# any line between an opening and closing ``` fence line is left
+# completely untouched by this pass, regardless of what it contains.
+_FENCE_LINE = re.compile(r"^ {0,3}`{3,}")
+
 
 def _strip_orphan_tag_openers(text: str) -> str:
     lines = text.split("\n")
     out_lines = []
+    in_fence = False
     for line in lines:
+        if _FENCE_LINE.match(line):
+            in_fence = not in_fence
+            out_lines.append(line)
+            continue
+        if in_fence:
+            out_lines.append(line)
+            continue
+
         def _repl(m: "re.Match") -> str:
             # Odd number of backticks before the match = inside an open
-            # code span on this line = leave it alone, it's literal text.
+            # inline code span on this line = leave it alone, it's
+            # literal text.
             if line[: m.start()].count("`") % 2 == 1:
                 return m.group(0)
-            # No real attribute-style "=" between here and the next "<"
-            # or end of line = this reads as plain prose/code that merely
-            # starts with a tag-name-shaped word, not a broken tag.
+            # The first word right after the tag name must itself be
+            # followed by "=" to read as a genuine attribute. Anything
+            # else (plain words, or an "=" only appearing later and
+            # unattached to the immediately-following word) reads as
+            # plain prose/code that merely starts with a tag-name-shaped
+            # word, not a broken tag.
             tail = line[m.end():]
-            next_lt = tail.find("<")
-            scope = tail[:next_lt] if next_lt != -1 else tail
-            if "=" not in scope:
-                return m.group(0)
-            return ""
+            if _ORPHAN_ATTR_PATTERN.match(tail):
+                return ""
+            return m.group(0)
 
         out_lines.append(_ORPHAN_TAG_PATTERN.sub(_repl, line))
     return "\n".join(out_lines)

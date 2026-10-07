@@ -180,6 +180,47 @@ def test_zwj_still_stripped_between_plain_text_characters():
     assert plugin.sanitize_text(text) == "hello"
 
 
+def test_zwj_stripped_between_non_sequence_symbol_pair():
+    # Regression (round 8 review): the round-7 fix's emoji-ish check
+    # treated ANY codepoint in a huge dingbat/emoji-plane range as
+    # "emoji-ish", not just characters that form a real, documented
+    # Unicode ZWJ-sequence relationship. Confirmed empirically: a heavy
+    # check mark + ZWJ + black star (not a defined emoji sequence) used
+    # to keep its ZWJ, letting the exact steganographic payload this
+    # function exists to strip survive untouched.
+    text = "\u2714\u200d\u2605"
+    result = plugin.sanitize_text(text)
+    assert "\u200d" not in result
+
+
+def test_orphan_tag_opener_not_stripped_by_unrelated_equals_later_on_line():
+    # Regression (round 8 review): the round-7 "=" guard on the orphan-
+    # tag-opener pass required an "=" to appear ANYWHERE between the
+    # match and the next "<"/end-of-line, with no check that it actually
+    # belonged to an attribute of the tag itself. Confirmed empirically:
+    # this exact input used to come back with the harmless "<b" deleted,
+    # purely because an unrelated "x=y" appeared many words later on the
+    # same line.
+    text = "<b the result is x=y so it stands alone"
+    assert plugin.sanitize_text(text) == text
+
+
+def test_orphan_tag_opener_inside_fenced_code_block_untouched():
+    # Regression (round 8 review): the backtick-code-span guard only
+    # checked backtick parity on the CURRENT line, with no notion of a
+    # triple-backtick fenced block spanning multiple lines. Confirmed
+    # empirically: an interior fence line with zero backticks of its own
+    # still had its "<a" stripped, destroying a documentation example
+    # the fence exists to preserve verbatim.
+    text = (
+        "Here is an example:\n"
+        "```html\n"
+        '<a href="unterminated example of broken markup\n'
+        "```\n"
+    )
+    assert plugin.sanitize_text(text) == text
+
+
 def test_does_not_strip_cpp_generic_syntax():
     # Regression (round 3 review): a bare "anything in angle brackets" regex
     # deleted C++/Java generic type arguments. vector<int> is not HTML.
